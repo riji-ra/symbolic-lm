@@ -6,12 +6,6 @@ import gc
 import warnings
 from scipy.stats import rankdata
 
-def spearman_correlation(x, y):
-    x = np.argsort(x)
-    y = np.argsort(y)
-    N = len(x)
-    return 1 - (6*sum((x - y)**2) / (N*(N**2 - 1)))
-
 
 def chatterjee_correlation(x, y):
     """
@@ -817,7 +811,7 @@ def batch_exec_structured_logits_1d(
 def safe_corr(a, b):
     a = np.asarray(a, dtype=np.float64).ravel()
     b = np.asarray(b, dtype=np.float64).ravel()
-    return np.sqrt(np.sqrt(chatterjee_correlation(a, b).max(0) * chatterjee_correlation(b, a).max(0) * np.abs(np.corrcoef(a, b)[0, 1]) * np.abs(spearman_correlation(a, b))))
+    return chatterjee_correlation(a, b).max(0) * chatterjee_correlation(b, a).max(0) * np.abs(np.corrcoef(a, b)[0, 1])
     """if a.size < 2:
         return 0.0
     sa = np.std(a); sb = np.std(b)
