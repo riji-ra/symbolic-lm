@@ -947,6 +947,7 @@ def run_demo(
 
         GENES1, GENES2, GENES3 = new1, new2, new3
         gc.collect()
+        np.savez(f"gen.npz", GENES1=GENES1, GENES2=GENES2, GENES3=GENES3)
 
     return elites
 
