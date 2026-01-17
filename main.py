@@ -844,7 +844,7 @@ def run_demo(
     last_k=1,
     iters=50,
     samples=256,
-    change_every=4,
+    change_every=8,
 ):
     # number of inputs: we feed only sid=0, but reserve a few to match your style if you want.
     # Here: num_inputs=8 for safety. (sid 0 gets x, others zeros)
@@ -987,5 +987,5 @@ def run_demo(
 
 # 実行例（まず「ちゃんと動くか」を見る用）
 if __name__ == "__main__":
-    elites = run_demo(MODELLEN=4096, POP=256, iters=10000, samples=1024, last_k=1, change_every=4)
+    elites = run_demo(MODELLEN=4096, POP=256, iters=10000, samples=1024, last_k=1, change_every=8)
     print("done. best elite corr:", max(e[-1] for e in elites))
