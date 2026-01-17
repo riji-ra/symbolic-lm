@@ -4,6 +4,41 @@ from copy import deepcopy
 import time
 import gc
 import warnings
+from scipy.stats import rankdata
+
+def spearman_correlation(x, y):
+    x = np.argsort(x)
+    y = np.argsort(y)
+    N = len(x)
+    return 1 - (6*sum((x - y)**2) / (N*(N**2 - 1)))
+
+
+def chatterjee_correlation(x, y):
+    """
+    Chatterjeeの順位相関係数 (ξn) を計算する関数
+    """
+    x = np.asarray(x)
+    y = np.asarray(y)
+    n = len(x)
+    
+    # 1. Xの昇順にデータをソートする
+    # argsortを使ってインデックスを取得し、Yを並べ替える
+    sort_idx = np.argsort(x)
+    y_sorted = y[sort_idx]
+    
+    # 2. Yの順位(ランク)を計算する
+    # rankdataはデフォルトで平均順位を返すが、ここでは単純化のためordinalを使う
+    # (厳密にはタイの処理が必要だが、概念理解のため簡略化)
+    r = rankdata(y_sorted, method='ordinal')
+    
+    # 3. 隣り合うランクの差の絶対値の総和を計算
+    diff_sum = np.sum(np.abs(np.diff(r)))
+    
+    # 4. 公式に当てはめる
+    xi = 1 - (3 * diff_sum) / (n**2 - 1)
+    
+    return xi
+
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 # =========================
@@ -782,7 +817,8 @@ def batch_exec_structured_logits_1d(
 def safe_corr(a, b):
     a = np.asarray(a, dtype=np.float64).ravel()
     b = np.asarray(b, dtype=np.float64).ravel()
-    if a.size < 2:
+    return np.sqrt(np.sqrt(chatterjee_correlation(a, b).max(0) * chatterjee_correlation(b, a).max(0) * np.abs(np.corrcoef(a, b)[0, 1]) * np.abs(spearman_correlation(a, b))))
+    """if a.size < 2:
         return 0.0
     sa = np.std(a); sb = np.std(b)
     if sa < 1e-12 or sb < 1e-12:
@@ -790,11 +826,11 @@ def safe_corr(a, b):
     c = np.corrcoef(a, b)[0, 1]
     if not np.isfinite(c):
         return 0.0
-    return float(np.abs(c))
+    return float(np.abs(c))"""
 
 def loss_from_corr(c):
     # 1-c in (0,2], log2 OK; clip for safety
-    return float(np.log2(1.0 - c))
+    return -c
 
 # =========================
 # Example: your gendata() style
@@ -987,5 +1023,5 @@ def run_demo(
 
 # 実行例（まず「ちゃんと動くか」を見る用）
 if __name__ == "__main__":
-    elites = run_demo(MODELLEN=4096, POP=256, iters=10000, samples=4096, last_k=1, change_every=8)
+    elites = run_demo(MODELLEN=4096, POP=256, iters=10000, samples=1024, last_k=1, change_every=8)
     print("done. best elite corr:", max(e[-1] for e in elites))
