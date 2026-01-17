@@ -3,6 +3,8 @@ from numba import njit
 from copy import deepcopy
 import time
 import gc
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 # =========================
 # 1D helper (TT/TT2)
