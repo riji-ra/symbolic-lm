@@ -10,7 +10,6 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 # 1D helper (TT/TT2)
 # =========================
 def TT(x):
-    x = np.asarray(x)
     if x.size < 3:
         return x.copy()
     return np.concatenate((np.ones(1, x.dtype),
@@ -18,7 +17,6 @@ def TT(x):
                            np.ones(1, x.dtype)))
 
 def TT2(x):
-    x = np.asarray(x)
     if x.size < 3:
         return x.copy()
     return np.concatenate((np.ones(1, x.dtype),
@@ -102,6 +100,8 @@ funcs_1 = [
     lambda x: np.fft.fft(x).imag / x.shape[0],
     lambda x: TT(x),
     lambda x: TT2(x),
+    lambda x: TT(TT(x)),
+    lambda x: TT(TT(TT(TT(x)))),
     lambda x: x * 0.5,
     lambda x: np.flip(x),
     lambda x: np.concatenate((np.zeros(1, x.dtype), x[:-1])),
@@ -127,11 +127,13 @@ funcs_1 = [
     lambda x: np.fft.ifft(np.abs(np.fft.fft(x + 0j)) ** 2).real,
     lambda x: np.cumsum(x) / (np.arange(x.size, dtype=np.float64)+1.0),
     lambda x: np.cumsum(x),
+    lambda x: np.cumprod(x / np.sqrt(np.mean(x ** 2) + 1e-12)),
     lambda x: np.abs(x),
     lambda x: np.maximum(x, 0),
     lambda x: x * len(x),
     lambda x: x / len(x),
     lambda x: np.take(TT(np.take(x, np.argsort(x))), np.argsort(np.argsort(x))),
+    lambda x: np.abs(x)**(1/3) * np.sign(x),
 ]
 
 funcs_2 = [
