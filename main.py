@@ -803,6 +803,8 @@ def gendata():
         gt[at[j], j] = 1.0
     return gt, np.float32(s)
 
+history = []
+
 # =========================
 # Minimal GA loop (tiny) to verify "runs"
 # =========================
@@ -947,7 +949,8 @@ def run_demo(
 
         GENES1, GENES2, GENES3 = new1, new2, new3
         gc.collect()
-        np.savez(f"gen.npz", GENES1=GENES1, GENES2=GENES2, GENES3=GENES3)
+        history.append(losses[best])
+        np.savez(f"gen.npz", GENES1=GENES1, GENES2=GENES2, GENES3=GENES3, history=history)
 
     return elites
 
