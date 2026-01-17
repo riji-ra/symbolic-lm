@@ -633,8 +633,8 @@ def batch_exec_structured_logits_1d(
     x_1d: (L,) float32
     returns logits: (N,last_k) float32 where each logit is mean(output_vector)
     """
-    x_1d = np.asarray(x_1d, dtype=np.float32).ravel()
-    L = x_1d.size
+    x_1d = np.asarray(x_1d, dtype=np.float32)
+    L = x_1d.shape[1]
 
     N = node_structs.shape[0]
     MODELLEN = node_structs.shape[1]
@@ -673,10 +673,10 @@ def batch_exec_structured_logits_1d(
     outputs = [None] * S
 
     # 入力ノードをそのまま渡す
-    for i in range(num_inputs):
-        outputs[i] = x_inputs[i]
+    for i in range(len(x_1d)):
+        outputs[i] = x_1d[i]
 
-    for i in range(num_inputs, S):
+    for i in range(len(x_1d), S):
         outputs[i] = None
 
     # compute in topo order
@@ -873,11 +873,11 @@ def run_demo(
 
         rank = np.argsort(losses)  # smaller is better
         best = rank[0]
-        print(f"step {step:4d}  best_corr={corrs[best]: .4f}  best_loss={losses[best]: .4f}  elites={len(elites)}")
-
-        if(oldacc > corrs[best]):
+        if(oldacc > losses[best]):
             elites.append((deepcopy(GENES1[best]), deepcopy(GENES2[best]), deepcopy(GENES3[best]), float(losses[best])))
-            oldacc = corrs[best]
+            oldacc = losses[best]
+
+        print(f"step {step:8d}  best_corr={corrs[best]: .8f}  best_loss={losses[best]: .8f}  elites={len(elites)}")
 
         # produce next gen: elitism + crossover/mutation (very simple)
         new1, new2, new3 = [], [], []
@@ -893,8 +893,8 @@ def run_demo(
 
         # rest by crossover
         while len(new1) < POP:
-            p1 = rank[np.random.randint(0, POP//3)]
-            p2 = rank[np.random.randint(0, POP//3)]
+            p1 = rank[np.random.randint(0, int(np.sqrt(POP)))]
+            p2 = rank[np.random.randint(0, int(np.sqrt(POP)))]
             c1 = deepcopy(GENES1[p1]); c2 = deepcopy(GENES2[p1]); c3 = deepcopy(GENES3[p1])
 
             a = np.random.randint(num_inputs, MODELLEN-1)
@@ -905,12 +905,12 @@ def run_demo(
             c3[a:b] = c3[a:b] * mix + GENES3[p2][a:b] * (1-mix)
 
             # mutate some refs / ops / alpha
-            if np.random.rand() < 0.5:
+            if np.random.rand() < 0.75:
                 for _ in range(np.random.randint(2, 2**np.random.randint(2, int(np.log2(MODELLEN))))):
                     pos = np.random.randint(num_inputs, MODELLEN)
                     which = np.random.randint(0, 3)
                     c1[pos, which] = np.random.randint(0, pos)  # ensure DAG
-            if np.random.rand() < 0.5:
+            if np.random.rand() < 0.75:
                 for _ in range(np.random.randint(2, 2**np.random.randint(2, int(np.log2(MODELLEN))))):
                     pos = np.random.randint(num_inputs, MODELLEN)
                     c2[pos] = np.random.choice(len_i0 + len_i1 + len_i2, p=T)
@@ -952,5 +952,5 @@ def run_demo(
 
 # 実行例（まず「ちゃんと動くか」を見る用）
 if __name__ == "__main__":
-    elites = run_demo(MODELLEN=2048, POP=128, iters=10000, samples=2048, last_k=1)
+    elites = run_demo(MODELLEN=4096, POP=256, iters=10000, samples=4096, last_k=1)
     print("done. best elite corr:", max(e[-1] for e in elites))
