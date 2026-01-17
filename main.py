@@ -1,0 +1,941 @@
+import numpy as np
+from numba import njit
+from copy import deepcopy
+import time
+import gc
+
+# =========================
+# 1D helper (TT/TT2)
+# =========================
+def TT(x):
+    x = np.asarray(x)
+    if x.size < 3:
+        return x.copy()
+    return np.concatenate((np.ones(1, x.dtype),
+                           (x[:-2] + x[1:-1]*2 + x[2:]) * 0.25,
+                           np.ones(1, x.dtype)))
+
+def TT2(x):
+    x = np.asarray(x)
+    if x.size < 3:
+        return x.copy()
+    return np.concatenate((np.ones(1, x.dtype),
+                           ((x[:-2] - x[1:-1])**2 + (x[1:-1] - x[2:])**2) * 0.5,
+                           np.ones(1, x.dtype)))
+
+# =========================
+# Stable-ish polynomial "attention"
+# (normal equation with powers, solve small system)
+# =========================
+def _attn_poly_fast(k, v, q, deg: int):
+    # Ensure inputs are finite and not too extreme
+    k = np.nan_to_num(k, nan=0.0, posinf=1e6, neginf=-1e6).astype(np.float64).ravel()
+    v = np.nan_to_num(v, nan=0.0, posinf=1e6, neginf=-1e6).astype(np.float64).ravel()
+    q = np.nan_to_num(q, nan=0.0, posinf=1e6, neginf=-1e6).astype(np.float64).ravel()
+
+    # Normalize k and q to range around [-1, 1] for stable polynomial basis
+    scale = np.max(np.abs(k)) + 1e-12
+    kn = k / scale
+    qn = q / scale
+
+    size = deg + 1
+    max_pow = 2 * deg
+
+    # P[n, m] = kn[n]^m for m=0..2deg
+    with np.errstate(over='ignore', invalid='ignore'):
+        P = kn[:, None] ** np.arange(max_pow + 1, dtype=np.float64)
+    
+    # Ensure P is finite (should be if kn in [-1, 1])
+    if not np.all(np.isfinite(P)):
+        return np.zeros_like(q, dtype=np.float64)
+
+    # A[i,j] = sum kn^(i+j)
+    A = np.empty((size, size), dtype=np.float64)
+    for i in range(size):
+        A[i] = P[:, i:i+size].sum(axis=0)
+
+    # b[i] = sum v*kn^i
+    b = (v[:, None] * P[:, :size]).sum(axis=0)
+
+    # adaptive ridge for stability
+    ridge = 1e-8 * np.trace(A) / size if size > 0 else 1e-10
+    A = A + np.eye(size, dtype=np.float64) * max(ridge, 1e-10)
+
+    # solve
+    try:
+        coef = np.linalg.solve(A, b)
+    except np.linalg.LinAlgError:
+        try:
+            coef = np.linalg.lstsq(A, b, rcond=1e-15)[0]
+        except np.linalg.LinAlgError:
+            # Last resort: return something safe if it still fails to converge
+            return np.zeros_like(q, dtype=np.float64)
+
+    # Evaluate at normalized qn
+    Q = qn[:, None] ** np.arange(size, dtype=np.float64)
+    return (Q @ coef).astype(np.float64)
+
+def attn_poly3_fast(k, v, q):  return _attn_poly_fast(np.nan_to_num(k), np.nan_to_num(v), np.nan_to_num(q), deg=3)
+def attn_poly5_fast(k, v, q):  return _attn_poly_fast(np.nan_to_num(k), np.nan_to_num(v), np.nan_to_num(q), deg=5)
+def attn_poly11_fast(k, v, q): return _attn_poly_fast(np.nan_to_num(k), np.nan_to_num(v), np.nan_to_num(q), deg=11)
+
+gg   = lambda x: np.abs(x)**(1/3)  * np.sign(x)
+ggg  = lambda x: np.abs(x)**0.2    * np.sign(x)
+gggg = lambda x: np.abs(x)**(1/11) * np.sign(x)
+
+# =========================================================
+# 1/2/3-ary function sets (your version, kept mostly)
+#  - each must take/return 1D arrays of same length
+# =========================================================
+funcs_1 = [
+    lambda x: x + 1,
+    lambda x: x * 2,
+    lambda x: x ** 2,
+    lambda x: -x,
+    lambda x: 1 / (x ** 2 + 1e-12),
+    lambda x: np.sort(x),
+    lambda x: np.argsort(x).astype(np.float32),
+    lambda x: np.argsort(np.argsort(x)).astype(np.float32),
+    lambda x: np.fft.fft(x).real / x.shape[0],
+    lambda x: np.fft.fft(x).imag / x.shape[0],
+    lambda x: TT(x),
+    lambda x: TT2(x),
+    lambda x: x * 0.5,
+    lambda x: np.flip(x),
+    lambda x: np.concatenate((np.zeros(1, x.dtype), x[:-1])),
+    lambda x: np.concatenate((x[1:], np.zeros(1, x.dtype))),
+    lambda x: np.concatenate((np.zeros(2, x.dtype), x[:-2])),
+    lambda x: np.concatenate((x[2:], np.zeros(2, x.dtype))),
+    lambda x: np.concatenate((np.zeros(4, x.dtype), x[:-4])),
+    lambda x: np.concatenate((x[4:], np.zeros(4, x.dtype))),
+    lambda x: np.mean(x, dtype=np.float64) + x * 0,
+    lambda x: (np.log(np.std(x) + 1e-12)).astype(np.float64) + x * 0,
+    lambda x: x * 0.1,
+    lambda x: (x - np.mean(x)) / (np.std(x) + 1e-12),
+    lambda x: x * 10,
+    lambda x: x ** 3,
+    lambda x: np.sin(x * np.pi),
+    lambda x: x - 1,
+    lambda x: x * 0.9,
+    lambda x: x * 1.1,
+    lambda x: np.sign(x) * np.abs(x) ** (1/3),
+    lambda x: np.tanh(x),
+    lambda x: x * -0.01,
+    lambda x: x * 0.01,
+    lambda x: np.fft.ifft(np.abs(np.fft.fft(x + 0j)) ** 2).real,
+    lambda x: np.cumsum(x) / (np.arange(x.size, dtype=np.float64)+1.0),
+    lambda x: np.cumsum(x),
+    lambda x: np.abs(x),
+    lambda x: np.maximum(x, 0),
+    lambda x: x * len(x),
+    lambda x: x / len(x),
+    lambda x: np.take(TT(np.take(x, np.argsort(x))), np.argsort(np.argsort(x))),
+]
+
+funcs_2 = [
+    lambda x, y: x + y,
+    lambda x, y: x - y,
+    lambda x, y: x * y,
+    lambda x, y: x / (y ** 2 + 1e-12),
+    lambda x, y: x / (np.abs(y) + 1e-12),
+    lambda x, y: (x - y) ** 2,
+    lambda x, y: (x + y) / 2,
+    lambda x, y: np.sqrt(x ** 2 + y ** 2),
+    lambda x, y: np.fft.ifft(np.fft.fft(x) * np.fft.fft(y) / x.shape[0]).real,
+    lambda x, y: np.fft.ifft(np.fft.fft(x) ** 2 / (np.fft.fft(y) + 1e-12)).real,
+    lambda x, y: np.take(x, np.argsort(y)),
+    lambda x, y: np.take(TT(np.take(x, np.argsort(y))), np.argsort(np.argsort(y))),
+    lambda x, y: np.maximum(x, y),
+    lambda x, y: np.minimum(x, y),
+    lambda x, y: np.sin(x * np.pi * y),
+    lambda x, y: attn_poly3_fast(x, y, y),
+    lambda x, y: gg(attn_poly3_fast(x**3, y**3, y**3)),
+    lambda x, y: attn_poly5_fast(x, y, y),
+    lambda x, y: ggg(attn_poly5_fast(x**5, y**5, y**5)),
+    lambda x, y: attn_poly11_fast(x, y, y),
+    lambda x, y: gggg(attn_poly11_fast(x**11, y**11, y**11)),
+]
+
+funcs_3 = [
+    lambda x, y, z: np.sqrt((x - y) ** 2 + (y - z) ** 2 + (z - x) ** 2),
+    lambda x, y, z: (x + y + z) / 3,
+    lambda x, y, z: np.sign(x * y * z) * np.abs(x * y * z) ** (1/3),
+    lambda x, y, z: x + y - z,
+    lambda x, y, z: np.sqrt(x ** 2 + y ** 2 + z ** 2),
+    lambda x, y, z: np.fft.ifft(np.fft.fft(x) * np.fft.fft(y) / (np.fft.fft(z) + 1e-12)).real,
+    lambda x, y, z: attn_poly3_fast(x, y, z),
+    lambda x, y, z: gg(attn_poly3_fast(x**3, y**3, z**3)),
+    lambda x, y, z: attn_poly5_fast(x, y, z),
+    lambda x, y, z: ggg(attn_poly5_fast(x**5, y**5, z**5)),
+    lambda x, y, z: attn_poly11_fast(x, y, z),
+    lambda x, y, z: gggg(attn_poly11_fast(x**11, y**11, z**11)),
+]
+
+i0t = funcs_1
+i1t = funcs_2
+i2t = funcs_3
+len_i0 = len(i0t)
+len_i1 = len(i1t)
+len_i2 = len(i2t)
+
+def build_T_distribution_1d(
+    i0t, i1t, i2t,
+    L=512,             # 1Dベクトル長
+    repeats=80,        # 1関数あたりの平均化回数（重いなら下げる）
+    warmup=5,          # ウォームアップ回数
+    power=0.7,         # 元コードの 0.7
+    seed=0,
+    eps=1e-12,
+):
+    """
+    各関数の平均実行時間を測って、遅いほど選ばれにくい分布Tを返す。
+    返り値:
+      T: shape (len(i0t)+len(i1t)+len(i2t),)  正規化済み確率
+      times: 同shapeで平均秒
+    """
+    rng = np.random.default_rng(seed)
+
+    def _bench_unary(f):
+        # 入力を毎回変える（キャッシュ効果/分岐癖を減らす）
+        x = rng.normal(0, 1, size=L).astype(np.float32)
+        for _ in range(warmup):
+            y = f(x)
+            x = np.asarray(y, dtype=np.float32).ravel()
+            if x.size != L:
+                x = np.resize(x, L).astype(np.float32, copy=False)
+        t0 = time.perf_counter()
+        for _ in range(repeats):
+            x = rng.normal(0, 1, size=L).astype(np.float32)
+            y = f(x)
+            y = np.asarray(y, dtype=np.float32).ravel()
+            # 形が変わる関数が混ざっても落ちないように丸める
+            if y.size != L:
+                y = np.resize(y, L)
+        t1 = time.perf_counter()
+        return (t1 - t0) / repeats
+
+    def _bench_binary(f):
+        x = rng.normal(0, 1, size=L).astype(np.float32)
+        y = rng.normal(0, 1, size=L).astype(np.float32)
+        for _ in range(warmup):
+            z = f(x, y)
+            z = np.asarray(z, dtype=np.float32).ravel()
+            if z.size != L:
+                z = np.resize(z, L)
+        t0 = time.perf_counter()
+        for _ in range(repeats):
+            x = rng.normal(0, 1, size=L).astype(np.float32)
+            y = rng.normal(0, 1, size=L).astype(np.float32)
+            z = f(x, y)
+            z = np.asarray(z, dtype=np.float32).ravel()
+            if z.size != L:
+                z = np.resize(z, L)
+        t1 = time.perf_counter()
+        return (t1 - t0) / repeats
+
+    def _bench_ternary(f):
+        x = rng.normal(0, 1, size=L).astype(np.float32)
+        y = rng.normal(0, 1, size=L).astype(np.float32)
+        z = rng.normal(0, 1, size=L).astype(np.float32)
+        for _ in range(warmup):
+            w = f(x, y, z)
+            w = np.asarray(w, dtype=np.float32).ravel()
+            if w.size != L:
+                w = np.resize(w, L)
+        t0 = time.perf_counter()
+        for _ in range(repeats):
+            x = rng.normal(0, 1, size=L).astype(np.float32)
+            y = rng.normal(0, 1, size=L).astype(np.float32)
+            z = rng.normal(0, 1, size=L).astype(np.float32)
+            w = f(x, y, z)
+            w = np.asarray(w, dtype=np.float32).ravel()
+            if w.size != L:
+                w = np.resize(w, L)
+        t1 = time.perf_counter()
+        return (t1 - t0) / repeats
+
+    times = []
+
+    # --- unary ---
+    for idx, f in enumerate(i0t):
+        try:
+            dt = _bench_unary(f)
+        except Exception:
+            dt = 1e9  # 壊れる関数は極端に重い扱いにして選ばれないように
+        times.append(dt)
+
+    # --- binary ---
+    for idx, f in enumerate(i1t):
+        try:
+            dt = _bench_binary(f)
+        except Exception:
+            dt = 1e9
+        times.append(dt)
+
+    # --- ternary ---
+    for idx, f in enumerate(i2t):
+        try:
+            dt = _bench_ternary(f)
+        except Exception:
+            dt = 1e9
+        times.append(dt)
+
+    times = np.asarray(times, dtype=np.float64)
+
+    # 遅いほど確率小: w = 1/(t^power)
+    w = 1.0 / (np.maximum(times, eps) ** power)
+
+    # 全部ゼロになった場合の保険
+    if not np.isfinite(w).all() or w.sum() <= 0:
+        w = np.ones_like(w)
+
+    T = (w / w.sum()).astype(np.float64)
+    return T, times
+
+T, times = build_T_distribution_1d(i0t, i1t, i2t)
+print("function distribution T:", T)
+
+# =========================
+# Structured execution engine (1D)
+# =========================
+QUANT_BITS = 12
+QUANT_SCALE = (1 << QUANT_BITS) - 1
+
+@njit(cache=True)
+def compute_used_nodes_numba(G1, G2, MODELLEN, last_k, len_i0, len_i1, num_inputs):
+    N = G1.shape[0]
+    used = np.zeros((N, MODELLEN), dtype=np.int8)
+    stack = np.empty(MODELLEN, dtype=np.int32)
+
+    for ind in range(N):
+        top = 0
+        start = MODELLEN - last_k
+        if start < num_inputs:
+            start = num_inputs
+        for s in range(start, MODELLEN):
+            stack[top] = s
+            top += 1
+
+        while top > 0:
+            top -= 1
+            n = stack[top]
+            if used[ind, n] == 1:
+                continue
+            used[ind, n] = 1
+            if n < num_inputs:
+                continue
+
+            func_id = int(G2[ind, n])
+            if func_id < len_i0:
+                a = int(abs(G1[ind, n, 0]))
+                if a >= 0 and a < MODELLEN and used[ind, a] == 0:
+                    stack[top] = a; top += 1
+            elif func_id < (len_i0 + len_i1):
+                a = int(abs(G1[ind, n, 0]))
+                b = int(abs(G1[ind, n, 1]))
+                if a >= 0 and a < MODELLEN and used[ind, a] == 0:
+                    stack[top] = a; top += 1
+                if b >= 0 and b < MODELLEN and used[ind, b] == 0:
+                    stack[top] = b; top += 1
+            else:
+                a = int(abs(G1[ind, n, 0]))
+                b = int(abs(G1[ind, n, 1]))
+                c = int(abs(G1[ind, n, 2]))
+                if a >= 0 and a < MODELLEN and used[ind, a] == 0:
+                    stack[top] = a; top += 1
+                if b >= 0 and b < MODELLEN and used[ind, b] == 0:
+                    stack[top] = b; top += 1
+                if c >= 0 and c < MODELLEN and used[ind, c] == 0:
+                    stack[top] = c; top += 1
+
+        for j in range(num_inputs):
+            used[ind, j] = 1
+
+    return used
+
+@njit(cache=True)
+def _hash_insert_get_sid(keys, vals, key, next_sid, mask):
+    h = (key ^ (key >> 33)) & mask
+    while True:
+        k = keys[h]
+        if k == -1:
+            keys[h] = key
+            vals[h] = next_sid
+            return next_sid, 1, next_sid + 1
+        elif k == key:
+            return vals[h], 0, next_sid
+        else:
+            h = (h + 1) & mask
+
+@njit(cache=True)
+def precompute_structs_numba(G1, G2, G3, len_i0, len_i1, len_i2, num_inputs, last_k=10):
+    N = G1.shape[0]
+    MODELLEN = G1.shape[1]
+    used = compute_used_nodes_numba(G1, G2, MODELLEN, last_k, len_i0, len_i1, num_inputs)
+
+    total_used = 0
+    for ind in range(N):
+        for node in range(MODELLEN):
+            if used[ind, node] == 1:
+                total_used += 1
+
+    size = 1
+    while size < total_used * 4:
+        size <<= 1
+    mask = size - 1
+
+    key_table_keys = np.empty(size, dtype=np.int64)
+    key_table_vals = np.full(size, -1, dtype=np.int32)
+    for i in range(size):
+        key_table_keys[i] = -1
+
+    max_S = total_used + num_inputs + 32
+    struct_type  = np.empty(max_S, dtype=np.int32)
+    struct_func  = np.empty(max_S, dtype=np.int32)
+    struct_ch1   = np.empty(max_S, dtype=np.int32)
+    struct_ch2   = np.empty(max_S, dtype=np.int32)
+    struct_ch3   = np.empty(max_S, dtype=np.int32)
+    struct_alpha = np.empty(max_S, dtype=np.float32)
+
+    next_sid = num_inputs
+    for sid in range(num_inputs):
+        struct_type[sid]  = 0
+        struct_func[sid]  = -1
+        struct_ch1[sid]   = -1
+        struct_ch2[sid]   = -1
+        struct_ch3[sid]   = -1
+        struct_alpha[sid] = 0.0
+
+    node_structs = np.full((N, MODELLEN), -1, dtype=np.int32)
+
+    pairs_ind  = np.empty(total_used + 1, dtype=np.int32)
+    pairs_node = np.empty(total_used + 1, dtype=np.int32)
+    pair_pos = 0
+
+    for node in range(MODELLEN):
+        for ind in range(N):
+            if used[ind, node] == 0:
+                continue
+
+            if node < num_inputs:
+                node_structs[ind, node] = node
+                pairs_ind[pair_pos] = ind
+                pairs_node[pair_pos] = node
+                pair_pos += 1
+                continue
+
+            func_id = int(G2[ind, node])
+
+            a_quant = int(np.floor(G3[ind, node] * QUANT_SCALE + 0.5))
+            if a_quant < 0: a_quant = 0
+            if a_quant > QUANT_SCALE: a_quant = QUANT_SCALE
+
+            if func_id < len_i0:
+                a = int(abs(G1[ind, node, 0]))
+                child_sid = node_structs[ind, a]
+                key = ((1 << 60) | (func_id << 36) | ((child_sid & 0xFFFFF) << 16) | (a_quant & 0xFFFF))
+
+            elif func_id < (len_i0 + len_i1):
+                bi = func_id - len_i0
+                a = int(abs(G1[ind, node, 0])); b = int(abs(G1[ind, node, 1]))
+                child_a = node_structs[ind, a]
+                child_b = node_structs[ind, b]
+                key = ((2 << 60) | (bi << 36) | ((child_a & 0xFFFFF) << 16) | (child_b & 0xFFF))
+                key = key ^ (a_quant & 0xFFFF)
+
+            else:
+                ci = func_id - (len_i0 + len_i1)
+                a = int(abs(G1[ind, node, 0])); b = int(abs(G1[ind, node, 1])); c = int(abs(G1[ind, node, 2]))
+                child_a = node_structs[ind, a]
+                child_b = node_structs[ind, b]
+                child_c = node_structs[ind, c]
+                key = ((3 << 60) | (ci << 36) | ((child_a & 0xFFFFF) << 16) | ((child_b & 0xFFF) << 6) | (child_c & 0x3F))
+                key = key ^ (a_quant & 0xFFFF)
+
+            sid, is_new, next_sid = _hash_insert_get_sid(key_table_keys, key_table_vals, key, next_sid, mask)
+
+            if is_new == 1:
+                if func_id < len_i0:
+                    struct_type[sid] = 1
+                    struct_func[sid] = func_id
+                    struct_ch1[sid] = child_sid
+                    struct_ch2[sid] = -1
+                    struct_ch3[sid] = -1
+                elif func_id < (len_i0 + len_i1):
+                    struct_type[sid] = 2
+                    struct_func[sid] = func_id - len_i0
+                    struct_ch1[sid] = child_a
+                    struct_ch2[sid] = child_b
+                    struct_ch3[sid] = -1
+                else:
+                    struct_type[sid] = 3
+                    struct_func[sid] = func_id - (len_i0 + len_i1)
+                    struct_ch1[sid] = child_a
+                    struct_ch2[sid] = child_b
+                    struct_ch3[sid] = child_c
+
+                struct_alpha[sid] = float(a_quant) / float(QUANT_SCALE)
+
+            node_structs[ind, node] = sid
+            pairs_ind[pair_pos] = ind
+            pairs_node[pair_pos] = node
+            pair_pos += 1
+
+    S = next_sid
+    struct_type  = struct_type[:S].copy()
+    struct_func  = struct_func[:S].copy()
+    struct_ch1   = struct_ch1[:S].copy()
+    struct_ch2   = struct_ch2[:S].copy()
+    struct_ch3   = struct_ch3[:S].copy()
+    struct_alpha = struct_alpha[:S].copy()
+
+    # map struct -> nodes (unused here, but kept)
+    counts = np.zeros(S, dtype=np.int32)
+    for p in range(pair_pos):
+        sid = node_structs[pairs_ind[p], pairs_node[p]]
+        counts[sid] += 1
+    idxs = np.empty(S + 1, dtype=np.int32)
+    idxs[0] = 0
+    for s in range(S):
+        idxs[s+1] = idxs[s] + counts[s]
+    M = idxs[-1]
+    struct_to_nodes_pair = np.empty((M, 2), dtype=np.int32)
+    write_pos = idxs[:-1].copy()
+    for p in range(pair_pos):
+        ind = pairs_ind[p]
+        node = pairs_node[p]
+        sid = node_structs[ind, node]
+        pos = write_pos[sid]
+        struct_to_nodes_pair[pos, 0] = ind
+        struct_to_nodes_pair[pos, 1] = node
+        write_pos[sid] += 1
+
+    return node_structs, struct_type, struct_func, struct_ch1, struct_ch2, struct_ch3, struct_alpha, idxs, struct_to_nodes_pair
+
+@njit(cache=True)
+def topo_sort_structs_numba_from_arrays(struct_type, struct_ch1, struct_ch2, struct_ch3):
+    S = struct_type.shape[0]
+    parent_count = np.zeros(S, dtype=np.int32)
+
+    for sid in range(S):
+        t = struct_type[sid]
+        if t == 1:
+            c = struct_ch1[sid]
+            if c >= 0: parent_count[c] += 1
+        elif t == 2:
+            c1 = struct_ch1[sid]; c2 = struct_ch2[sid]
+            if c1 >= 0: parent_count[c1] += 1
+            if c2 >= 0: parent_count[c2] += 1
+        elif t == 3:
+            c1 = struct_ch1[sid]; c2 = struct_ch2[sid]; c3 = struct_ch3[sid]
+            if c1 >= 0: parent_count[c1] += 1
+            if c2 >= 0: parent_count[c2] += 1
+            if c3 >= 0: parent_count[c3] += 1
+
+    tot = 0
+    offsets = np.empty(S, dtype=np.int32)
+    for i in range(S):
+        offsets[i] = tot
+        tot += parent_count[i]
+    parent_buf = np.empty(tot, dtype=np.int32)
+
+    for i in range(S):
+        parent_count[i] = 0
+
+    for sid in range(S):
+        t = struct_type[sid]
+        if t == 1:
+            c = struct_ch1[sid]
+            if c >= 0:
+                idx = offsets[c] + parent_count[c]
+                parent_buf[idx] = sid
+                parent_count[c] += 1
+        elif t == 2:
+            c1 = struct_ch1[sid]; c2 = struct_ch2[sid]
+            if c1 >= 0:
+                idx = offsets[c1] + parent_count[c1]
+                parent_buf[idx] = sid
+                parent_count[c1] += 1
+            if c2 >= 0:
+                idx = offsets[c2] + parent_count[c2]
+                parent_buf[idx] = sid
+                parent_count[c2] += 1
+        elif t == 3:
+            c1 = struct_ch1[sid]; c2 = struct_ch2[sid]; c3 = struct_ch3[sid]
+            if c1 >= 0:
+                idx = offsets[c1] + parent_count[c1]
+                parent_buf[idx] = sid
+                parent_count[c1] += 1
+            if c2 >= 0:
+                idx = offsets[c2] + parent_count[c2]
+                parent_buf[idx] = sid
+                parent_count[c2] += 1
+            if c3 >= 0:
+                idx = offsets[c3] + parent_count[c3]
+                parent_buf[idx] = sid
+                parent_count[c3] += 1
+
+    indeg = np.zeros(S, dtype=np.int32)
+    for sid in range(S):
+        t = struct_type[sid]
+        if t == 1:
+            indeg[sid] += (struct_ch1[sid] >= 0)
+        elif t == 2:
+            indeg[sid] += (struct_ch1[sid] >= 0)
+            indeg[sid] += (struct_ch2[sid] >= 0)
+        elif t == 3:
+            indeg[sid] += (struct_ch1[sid] >= 0)
+            indeg[sid] += (struct_ch2[sid] >= 0)
+            indeg[sid] += (struct_ch3[sid] >= 0)
+
+    q = np.empty(S, dtype=np.int32)
+    ql = 0; qr = 0
+    for s in range(S):
+        if indeg[s] == 0:
+            q[qr] = s; qr += 1
+
+    out = np.empty(S, dtype=np.int32)
+    out_len = 0
+    while ql < qr:
+        s = q[ql]; ql += 1
+        out[out_len] = s; out_len += 1
+        start = offsets[s]
+        end = offsets[s] + parent_count[s]
+        for pidx in range(start, end):
+            p = parent_buf[pidx]
+            indeg[p] -= 1
+            if indeg[p] == 0:
+                q[qr] = p; qr += 1
+
+    if out_len < S:
+        res = np.empty(out_len, dtype=np.int32)
+        for i in range(out_len):
+            res[i] = out[i]
+        return res
+    return out
+
+def batch_exec_structured_logits_1d(
+    x_1d: np.ndarray,
+    node_structs,
+    struct_type,
+    struct_func,
+    struct_ch1,
+    struct_ch2,
+    struct_ch3,
+    struct_alpha,
+    topo,
+    last_k=1,
+    restrict=True,
+):
+    """
+    x_1d: (L,) float32
+    returns logits: (N,last_k) float32 where each logit is mean(output_vector)
+    """
+    x_1d = np.asarray(x_1d, dtype=np.float32).ravel()
+    L = x_1d.size
+
+    N = node_structs.shape[0]
+    MODELLEN = node_structs.shape[1]
+    S = struct_type.shape[0]
+
+    # needed selection
+    if restrict:
+        needed = np.zeros(S, dtype=np.bool_)
+        start_nodes = range(max(0, MODELLEN - last_k), MODELLEN)
+        q = []
+        for ind in range(N):
+            for ln in start_nodes:
+                sid = int(node_structs[ind, ln])
+                if sid >= 0 and not needed[sid]:
+                    needed[sid] = True
+                    q.append(sid)
+        qi = 0
+        while qi < len(q):
+            s = q[qi]; qi += 1
+            c1 = int(struct_ch1[s]); c2 = int(struct_ch2[s]); c3 = int(struct_ch3[s])
+            if c1 >= 0 and not needed[c1]:
+                needed[c1] = True; q.append(c1)
+            if c2 >= 0 and not needed[c2]:
+                needed[c2] = True; q.append(c2)
+            if c3 >= 0 and not needed[c3]:
+                needed[c3] = True; q.append(c3)
+    else:
+        needed = np.ones(S, dtype=np.bool_)
+
+    # outputs per struct sid (vectors)
+    outputs = [None] * S
+
+    # input sids are 0..(num_inputs-1) but here we only feed ONE vector;
+    # if you want multiple inputs, stack/partition your x_1d beforehand.
+    # For now: sid=0 gets x, others get zeros.
+    outputs[0] = x_1d
+    for j in range(1, min(8, S)):
+        outputs[j] = np.zeros(L, dtype=np.float32)
+
+    # compute in topo order
+    for sid in topo:
+        sid = int(sid)
+        if sid < 0 or sid >= S: 
+            continue
+        if not needed[sid]:
+            continue
+        if struct_type[sid] == 0:
+            continue
+
+        t = int(struct_type[sid])
+        alpha = float(struct_alpha[sid])
+
+        if t == 1:
+            fid = int(struct_func[sid])
+            c1 = int(struct_ch1[sid])
+            a = outputs[c1]
+            base = i0t[fid](a)
+            base = np.asarray(base, dtype=np.float32).ravel()
+            outputs[sid] = (1.0 - alpha) * base + alpha * a
+
+        elif t == 2:
+            fid = int(struct_func[sid])
+            c1 = int(struct_ch1[sid]); c2 = int(struct_ch2[sid])
+            a = outputs[c1]; b = outputs[c2]
+            base = i1t[fid](a, b)
+            base = np.asarray(base, dtype=np.float32).ravel()
+            outputs[sid] = (1.0 - alpha) * base + alpha * a
+
+        elif t == 3:
+            fid = int(struct_func[sid])
+            c1 = int(struct_ch1[sid]); c2 = int(struct_ch2[sid]); c3 = int(struct_ch3[sid])
+            a = outputs[c1]; b = outputs[c2]; c = outputs[c3]
+            base = i2t[fid](a, b, c)
+            base = np.asarray(base, dtype=np.float32).ravel()
+            outputs[sid] = (1.0 - alpha) * base + alpha * a
+
+        else:
+            raise RuntimeError(f"unknown struct type: {t}")
+
+    # logits: mean of last_k nodes per individual
+    last_nodes = np.arange(max(0, MODELLEN - last_k), MODELLEN, dtype=np.int32)
+    last_sids = node_structs[:, last_nodes]  # (N,last_k)
+
+    logits = np.zeros((N, last_k), dtype=np.float32)
+
+    uniq = np.unique(last_sids[last_sids >= 0])
+    sid_mean = np.zeros(S, dtype=np.float32)
+    sid_has = np.zeros(S, dtype=np.bool_)
+    for usid in uniq:
+        usid = int(usid)
+        arr = outputs[usid]
+        if arr is None:
+            continue
+        v = float(np.sum(arr))
+        if np.isfinite(v):
+            sid_mean[usid] = v
+            sid_has[usid] = True
+
+    for i in range(N):
+        for j in range(last_k):
+            sid = int(last_sids[i, j])
+            if sid >= 0 and sid_has[sid]:
+                logits[i, j] = sid_mean[sid]
+
+    return logits
+
+# =========================
+# Safe correlation loss (no NaN/-inf)
+# =========================
+def safe_corr(a, b):
+    a = np.asarray(a, dtype=np.float64).ravel()
+    b = np.asarray(b, dtype=np.float64).ravel()
+    if a.size < 2:
+        return 0.0
+    sa = np.std(a); sb = np.std(b)
+    if sa < 1e-12 or sb < 1e-12:
+        return 0.0
+    c = np.corrcoef(a, b)[0, 1]
+    if not np.isfinite(c):
+        return 0.0
+    return float(np.abs(c))
+
+def loss_from_corr(c):
+    # 1-c in (0,2], log2 OK; clip for safety
+    return float(np.log2(1.0 - c))
+
+# =========================
+# Example: your gendata() style
+# =========================
+A = {"0":0,"1":1,"2":2,"3":3,"4":4,"5":5,"6":6,"7":7,"8":8,"9":9,"+":10,"-":11,"*":12,"/":13,"=":14}
+def generatetekito():
+    S = int(np.random.randint(1, 2 ** np.random.randint(4, 12)) * (np.random.randint(0, 1) * 2 - 1))
+    S2 = int(np.random.randint(1, 2 ** np.random.randint(4, 12)) * (np.random.randint(0, 1) * 2 - 1))
+    S3 = int(np.random.randint(1, 2 ** np.random.randint(4, 12)) * (np.random.randint(0, 1) * 2 - 1))
+    enz = np.random.randint(0, 13)
+    if enz == 0:  return f"{S}+{S2}={S+S2}"
+    if enz == 1:  return f"{S}-{S2}={S-S2}"
+    if enz == 2:  return f"{S}*{S2}={S*S2}"
+    if enz == 3:  return f"{S}/{S2}={S//S2}"
+    if enz == 4:  return f"{S}+{S2}+{S3}={S+S2+S3}"
+    if enz == 5:  return f"{S}+{S2}-{S3}={S+S2-S3}"
+    if enz == 6:  return f"{S}+{S2}*{S3}={S+S2*S3}"
+    if enz == 7:  return f"{S}*{S2}+{S3}={S*S2+S3}"
+    if enz == 8:  return f"{S}*{S2}-{S3}={S*S2-S3}"
+    if enz == 9:  return f"{S}-{S2}*{S3}={S-S2*S3}"
+    if enz == 10: return f"{S}*{S2}/{S3}={int(S*S2/S3)}"
+    if enz == 11: return f"{S}-{S2}/{S3}={S - S2//S3}"
+    return f"{S}/{S2}*{S3}={int(S/S2*S3)}"
+
+def gendata():
+    at = [A[_] for _ in generatetekito()]
+    s = 1.0
+    g = np.random.choice(len(at), len(at), replace=False)
+    for i in range(np.random.randint(0, len(at)+1)):
+        t = np.random.randint(0, 15)
+        if t != at[g[i]]:
+            s -= 1.0 / len(at)
+        at[g[i]] = t
+    gt = np.zeros((15, len(at)), dtype=np.float32)
+    for j in range(len(at)):
+        gt[at[j], j] = 1.0
+    return gt, np.float32(s)
+
+# =========================
+# Minimal GA loop (tiny) to verify "runs"
+# =========================
+def run_demo(
+    MODELLEN=2048,
+    POP=32,
+    last_k=1,
+    iters=50,
+    samples=256,
+):
+    # number of inputs: we feed only sid=0, but reserve a few to match your style if you want.
+    # Here: num_inputs=8 for safety. (sid 0 gets x, others zeros)
+    num_inputs = 8
+
+    # init genes
+    GENES1 = []
+    GENES2 = []
+    GENES3 = []
+    for _ in range(POP):
+        G1 = np.abs((1 - np.random.uniform(0, 1, (MODELLEN, 3))) * (np.arange(MODELLEN)[:, None]))
+        G2 = np.random.choice(len_i0 + len_i1 + len_i2, size=(MODELLEN,), p=T)
+        G3 = np.random.uniform(0, 1, size=(MODELLEN,)).astype(np.float32)
+        GENES1.append(G1.astype(np.int64))
+        GENES2.append(G2.astype(np.int64))
+        GENES3.append(G3.astype(np.float32))
+
+    elites = []
+    dats = []
+    oldacc = 0
+
+    for step in range(iters):
+        # stack population
+        G1 = np.stack(GENES1, axis=0)  # (N,MODELLEN,3)
+        G2 = np.stack(GENES2, axis=0)  # (N,MODELLEN)
+        G3 = np.stack(np.zeros_like(GENES3), axis=0)  # (N,MODELLEN)
+
+        node_structs, struct_type, struct_func, struct_ch1, struct_ch2, struct_ch3, struct_alpha, idxs, pairs = \
+            precompute_structs_numba(G1, G2, G3, len_i0, len_i1, len_i2, num_inputs=num_inputs, last_k=last_k)
+        topo = topo_sort_structs_numba_from_arrays(struct_type, struct_ch1, struct_ch2, struct_ch3)
+
+        # evaluate
+        if(step % 8 == 0):
+            dats = []
+            for _ in range(samples):
+                gt, score = gendata()
+                dats.append((gt, score))
+        logits_all = []
+        targets = []
+        for _ in dats:
+            gt, score = _
+            x = gt.flatten()  # 1D input
+            logit = batch_exec_structured_logits_1d(
+                x, node_structs, struct_type, struct_func, struct_ch1, struct_ch2, struct_ch3,
+                struct_alpha, topo, last_k=last_k, restrict=True
+            )[:, 0]  # (POP,)
+            logits_all.append(logit)
+            targets.append(score)
+
+        logits_all = np.asarray(logits_all, dtype=np.float32)  # (samples, POP)
+        targets = np.asarray(targets, dtype=np.float32)        # (samples,)
+
+        losses = np.zeros(POP, dtype=np.float64)
+        corrs = np.zeros(POP, dtype=np.float64)
+        for i in range(POP):
+            c = safe_corr(logits_all[:, i], targets)
+            corrs[i] = c
+            losses[i] = loss_from_corr(c)
+
+        rank = np.argsort(losses)  # smaller is better
+        best = rank[0]
+        print(f"step {step:4d}  best_corr={corrs[best]: .4f}  best_loss={losses[best]: .4f}")
+
+        if(oldacc < corrs[best]):
+            elites.append((deepcopy(GENES1[best]), deepcopy(GENES2[best]), deepcopy(GENES3[best]), float(losses[best])))
+        oldacc = corrs[best]
+
+        # produce next gen: elitism + crossover/mutation (very simple)
+        new1, new2, new3 = [], [], []
+        # keep top 4
+        for k in range(min(4, POP)):
+            idx = rank[k]
+            new1.append(deepcopy(GENES1[idx]))
+            new2.append(deepcopy(GENES2[idx]))
+            new3.append(deepcopy(GENES3[idx]))
+        new1.extend([_[0] for _ in elites[-32:]])
+        new2.extend([_[1] for _ in elites[-32:]])
+        new3.extend([_[2] for _ in elites[-32:]])
+
+        # rest by crossover
+        while len(new1) < POP:
+            p1 = rank[np.random.randint(0, POP//3)]
+            p2 = rank[np.random.randint(0, POP//3)]
+            c1 = deepcopy(GENES1[p1]); c2 = deepcopy(GENES2[p1]); c3 = deepcopy(GENES3[p1])
+
+            a = np.random.randint(num_inputs, MODELLEN-1)
+            b = np.random.randint(a, MODELLEN)
+            c1[a:b] = GENES1[p2][a:b]
+            c2[a:b] = GENES2[p2][a:b]
+            mix = np.random.uniform(0, 1)
+            c3[a:b] = c3[a:b] * mix + GENES3[p2][a:b] * (1-mix)
+
+            # mutate some refs / ops / alpha
+            if np.random.rand() < 0.75:
+                for _ in range(np.random.randint(2, 2**np.random.randint(2, int(np.log2(MODELLEN))))):
+                    pos = np.random.randint(num_inputs, MODELLEN)
+                    which = np.random.randint(0, 3)
+                    c1[pos, which] = np.random.randint(0, pos)  # ensure DAG
+            if np.random.rand() < 0.75:
+                for _ in range(np.random.randint(2, 2**np.random.randint(2, int(np.log2(MODELLEN))))):
+                    pos = np.random.randint(num_inputs, MODELLEN)
+                    c2[pos] = np.random.choice(len_i0 + len_i1 + len_i2, p=T)
+            if np.random.rand() < 0.3:
+                for _ in range(np.random.randint(1, 6)):
+                    pos = np.random.randint(num_inputs, MODELLEN)
+                    c3[pos] = np.clip(c3[pos] + np.random.normal(0, 0.2), 0.0, 1.0)
+            if np.random.rand() < 0.1:
+                pos1 = np.random.randint(num_inputs, MODELLEN-2)
+                pos2 = np.random.randint(pos1, MODELLEN)
+                c2[pos1:pos2] = np.random.choice(len_i0 + len_i1 + len_i2, size=(pos2-pos1,), p=T)
+            if np.random.rand() < 0.1:
+                pos1 = np.random.randint(num_inputs, MODELLEN-2)
+                pos2 = np.random.randint(pos1, MODELLEN)
+                c1[pos1:pos2] = np.random.randint(0, pos1, size=(pos2-pos1,3))
+            if np.random.rand() < 0.1:
+                size = 2**np.random.randint(0, int(np.log2(MODELLEN)-2))
+                pos1 = np.random.randint(num_inputs+size, MODELLEN-size-1)
+                pos2 = np.random.randint(pos1, MODELLEN-size)
+                pos3 = np.random.randint(0, size)
+                c1[pos1+pos3:pos2+pos3] = c1[pos1:pos2]
+                c2[pos1+pos3:pos2+pos3] = c2[pos1:pos2]
+                c3[pos1+pos3:pos2+pos3] = c3[pos1:pos2]
+
+            new1.append(c1); new2.append(c2); new3.append(c3)
+
+        GENES1, GENES2, GENES3 = new1, new2, new3
+        gc.collect()
+
+    return elites
+
+# 実行例（まず「ちゃんと動くか」を見る用）
+if __name__ == "__main__":
+    elites = run_demo(MODELLEN=2048, POP=64, iters=10000, samples=2048, last_k=1)
+    print("done. best elite corr:", max(e[-1] for e in elites))
