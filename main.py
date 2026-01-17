@@ -1017,5 +1017,5 @@ def run_demo(
 
 # 実行例（まず「ちゃんと動くか」を見る用）
 if __name__ == "__main__":
-    elites = run_demo(MODELLEN=4096, POP=256, iters=10000, samples=1024, last_k=1, change_every=8)
+    elites = run_demo(MODELLEN=4096, POP=256, iters=10000, samples=4096, last_k=1, change_every=8)
     print("done. best elite corr:", max(e[-1] for e in elites))
