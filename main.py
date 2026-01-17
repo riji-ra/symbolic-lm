@@ -618,8 +618,22 @@ def topo_sort_structs_numba_from_arrays(struct_type, struct_ch1, struct_ch2, str
         return res
     return out
 
+def _as_vec32(y, L):
+    # なるべくコピーしないで float32 1D に揃える
+    if isinstance(y, np.ndarray):
+        if y.dtype != np.float32:
+            y = y.astype(np.float32, copy=False)
+        y = y.ravel()
+        if y.size != L:
+            y = np.resize(y, L).astype(np.float32, copy=False)
+        return y
+    y = np.asarray(y, dtype=np.float32).ravel()
+    if y.size != L:
+        y = np.resize(y, L).astype(np.float32, copy=False)
+    return y
+
 def batch_exec_structured_logits_1d(
-    x_1d: np.ndarray,
+    x_inputs: np.ndarray,   # (num_inputs, L)
     node_structs,
     struct_type,
     struct_func,
@@ -631,120 +645,134 @@ def batch_exec_structured_logits_1d(
     last_k=1,
     restrict=True,
 ):
-    """
-    x_1d: (L,) float32
-    returns logits: (N,last_k) float32 where each logit is mean(output_vector)
-    """
-    x_1d = np.asarray(x_1d, dtype=np.float32)
-    L = x_1d.shape[1]
+    x_inputs = np.asarray(x_inputs, dtype=np.float32)
+    if x_inputs.ndim != 2:
+        raise ValueError("x_inputs must be (num_inputs, L)")
+    num_inputs, L = x_inputs.shape
 
     N = node_structs.shape[0]
     MODELLEN = node_structs.shape[1]
     S = struct_type.shape[0]
 
-    # needed selection
+    # --- needed mask (Pythonで十分軽いが、リストappendを減らす) ---
     if restrict:
         needed = np.zeros(S, dtype=np.bool_)
-        start_nodes = range(max(0, MODELLEN - last_k), MODELLEN)
-        q = []
+        start0 = max(num_inputs, MODELLEN - last_k)
+        q = np.empty(N * last_k + 1024, dtype=np.int32)
+        qlen = 0
+
         for ind in range(N):
-            for ln in start_nodes:
+            for ln in range(start0, MODELLEN):
                 sid = int(node_structs[ind, ln])
                 if sid >= 0 and not needed[sid]:
                     needed[sid] = True
-                    q.append(sid)
+                    if qlen >= q.size:
+                        q = np.resize(q, q.size * 2)
+                    q[qlen] = sid
+                    qlen += 1
+
         qi = 0
-        while qi < len(q):
-            s = q[qi]; qi += 1
+        while qi < qlen:
+            s = int(q[qi]); qi += 1
             c1 = int(struct_ch1[s]); c2 = int(struct_ch2[s]); c3 = int(struct_ch3[s])
             if c1 >= 0 and not needed[c1]:
-                needed[c1] = True; q.append(c1)
+                needed[c1] = True; 
+                if qlen >= q.size: q = np.resize(q, q.size * 2)
+                q[qlen] = c1; qlen += 1
             if c2 >= 0 and not needed[c2]:
-                needed[c2] = True; q.append(c2)
+                needed[c2] = True; 
+                if qlen >= q.size: q = np.resize(q, q.size * 2)
+                q[qlen] = c2; qlen += 1
             if c3 >= 0 and not needed[c3]:
-                needed[c3] = True; q.append(c3)
+                needed[c3] = True; 
+                if qlen >= q.size: q = np.resize(q, q.size * 2)
+                q[qlen] = c3; qlen += 1
     else:
-        needed = np.ones(S, dtype=np.bool_)
+        needed = None  # 全部必要扱い
 
-    # outputs per struct sid (vectors)
+    # --- outputs ---
     outputs = [None] * S
+    # input sid 0..num_inputs-1
+    for i in range(min(num_inputs, S)):
+        outputs[i] = x_inputs[i]
 
-    # input sids are 0..(num_inputs-1) but here we only feed ONE vector;
-    # if you want multiple inputs, stack/partition your x_1d beforehand.
-    # For now: sid=0 gets x, others get zeros.
-    outputs = [None] * S
+    # ローカル参照で少し速く
+    _i0t = i0t; _i1t = i1t; _i2t = i2t
+    _stype = struct_type
+    _sf = struct_func
+    _c1a = struct_ch1; _c2a = struct_ch2; _c3a = struct_ch3
+    _alpha = struct_alpha
 
-    # 入力ノードをそのまま渡す
-    for i in range(len(x_1d)):
-        outputs[i] = x_1d[i]
-
-    for i in range(len(x_1d), S):
-        outputs[i] = None
-
-    # compute in topo order
     for sid in topo:
         sid = int(sid)
-        if sid < 0 or sid >= S: 
+        if sid < 0 or sid >= S:
             continue
-        if not needed[sid]:
+        if needed is not None and not needed[sid]:
             continue
-        if struct_type[sid] == 0:
+        t = int(_stype[sid])
+        if t == 0:
             continue
 
-        t = int(struct_type[sid])
-        alpha = float(struct_alpha[sid])
+        a = float(_alpha[sid])
 
         if t == 1:
-            fid = int(struct_func[sid])
-            c1 = int(struct_ch1[sid])
-            a = outputs[c1]
-            base = i0t[fid](a)
-            base = np.asarray(base, dtype=np.float32).ravel()
-            outputs[sid] = (1.0 - alpha) * base + alpha * a
+            fid = int(_sf[sid])
+            c1 = int(_c1a[sid])
+            x = outputs[c1]
+            base = _i0t[fid](x)
+            base = _as_vec32(base, L)
+            # alpha mix: (1-a)*base + a*x
+            outputs[sid] = base * (1.0 - a) + x * a
 
         elif t == 2:
-            fid = int(struct_func[sid])
-            c1 = int(struct_ch1[sid]); c2 = int(struct_ch2[sid])
-            a = outputs[c1]; b = outputs[c2]
-            base = i1t[fid](a, b)
-            base = np.asarray(base, dtype=np.float32).ravel()
-            outputs[sid] = (1.0 - alpha) * base + alpha * a
+            fid = int(_sf[sid])
+            c1 = int(_c1a[sid]); c2 = int(_c2a[sid])
+            x = outputs[c1]; y = outputs[c2]
+            base = _i1t[fid](x, y)
+            base = _as_vec32(base, L)
+            outputs[sid] = base * (1.0 - a) + x * a
 
         elif t == 3:
-            fid = int(struct_func[sid])
-            c1 = int(struct_ch1[sid]); c2 = int(struct_ch2[sid]); c3 = int(struct_ch3[sid])
-            a = outputs[c1]; b = outputs[c2]; c = outputs[c3]
-            base = i2t[fid](a, b, c)
-            base = np.asarray(base, dtype=np.float32).ravel()
-            outputs[sid] = (1.0 - alpha) * base + alpha * a
+            fid = int(_sf[sid])
+            c1 = int(_c1a[sid]); c2 = int(_c2a[sid]); c3 = int(_c3a[sid])
+            x = outputs[c1]; y = outputs[c2]; z = outputs[c3]
+            base = _i2t[fid](x, y, z)
+            base = _as_vec32(base, L)
+            outputs[sid] = base * (1.0 - a) + x * a
 
         else:
             raise RuntimeError(f"unknown struct type: {t}")
 
-    # logits: mean of last_k nodes per individual
+    # --- logits: last_k の sid だけ集計（np.uniqueをやめる）---
     last_nodes = np.arange(max(0, MODELLEN - last_k), MODELLEN, dtype=np.int32)
     last_sids = node_structs[:, last_nodes]  # (N,last_k)
 
-    logits = np.zeros((N, last_k), dtype=np.float32)
+    need_last = np.zeros(S, dtype=np.bool_)
+    for i in range(N):
+        for j in range(last_k):
+            s = int(last_sids[i, j])
+            if s >= 0:
+                need_last[s] = True
 
-    uniq = np.unique(last_sids[last_sids >= 0])
-    sid_mean = np.zeros(S, dtype=np.float32)
+    sid_sum = np.zeros(S, dtype=np.float32)
     sid_has = np.zeros(S, dtype=np.bool_)
-    for usid in uniq:
-        usid = int(usid)
-        arr = outputs[usid]
+    for s in range(S):
+        if not need_last[s]:
+            continue
+        arr = outputs[s]
         if arr is None:
             continue
         v = float(np.sum(arr))
         if np.isfinite(v):
-            sid_mean[usid] = v
-            sid_has[usid] = True
+            sid_sum[s] = v
+            sid_has[s] = True
 
+    logits = np.zeros((N, last_k), dtype=np.float32)
     for i in range(N):
         for j in range(last_k):
-            sid = int(last_sids[i, j])
-            if sid >= 0 and sid_has[sid]:
-                logits[i, j] = sid_mean[sid]
+            s = int(last_sids[i, j])
+            if s >= 0 and sid_has[s]:
+                logits[i, j] = sid_sum[s]
 
     return logits
 
@@ -881,7 +909,7 @@ def run_demo(
             elites.append((deepcopy(GENES1[best]), deepcopy(GENES2[best]), deepcopy(GENES3[best]), float(losses[best])))
             oldacc = losses[best]
 
-        print(f"step {step:8d}  best_corr={corrs[best]: .8f}  best_loss={losses[best]: .8f}  elites={len(elites)}")
+        print(f"{step}, {losses[best]}, {len(elites)}")
 
         # produce next gen: elitism + crossover/mutation (very simple)
         new1, new2, new3 = [], [], []
