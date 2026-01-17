@@ -909,7 +909,7 @@ def run_demo(
             elites.append((deepcopy(GENES1[best]), deepcopy(GENES2[best]), deepcopy(GENES3[best]), float(losses[best])))
             oldacc = losses[best]
 
-        print(f"{step}, {losses[best]}, {len(elites)}")
+        print(f"{step}, {-losses[best]}, {len(elites)}")
 
         # produce next gen: elitism + crossover/mutation (very simple)
         new1, new2, new3 = [], [], []
