@@ -900,12 +900,12 @@ def run_demo(
             c3[a:b] = c3[a:b] * mix + GENES3[p2][a:b] * (1-mix)
 
             # mutate some refs / ops / alpha
-            if np.random.rand() < 0.75:
+            if np.random.rand() < 0.5:
                 for _ in range(np.random.randint(2, 2**np.random.randint(2, int(np.log2(MODELLEN))))):
                     pos = np.random.randint(num_inputs, MODELLEN)
                     which = np.random.randint(0, 3)
                     c1[pos, which] = np.random.randint(0, pos)  # ensure DAG
-            if np.random.rand() < 0.75:
+            if np.random.rand() < 0.5:
                 for _ in range(np.random.randint(2, 2**np.random.randint(2, int(np.log2(MODELLEN))))):
                     pos = np.random.randint(num_inputs, MODELLEN)
                     c2[pos] = np.random.choice(len_i0 + len_i1 + len_i2, p=T)
@@ -913,20 +913,28 @@ def run_demo(
                 for _ in range(np.random.randint(1, 6)):
                     pos = np.random.randint(num_inputs, MODELLEN)
                     c3[pos] = np.clip(c3[pos] + np.random.normal(0, 0.2), 0.0, 1.0)
-            if np.random.rand() < 0.1:
+            if np.random.rand() < 0.05:
                 pos1 = np.random.randint(num_inputs, MODELLEN-2)
                 pos2 = np.random.randint(pos1, MODELLEN)
                 c2[pos1:pos2] = np.random.choice(len_i0 + len_i1 + len_i2, size=(pos2-pos1,), p=T)
-            if np.random.rand() < 0.1:
+            if np.random.rand() < 0.05:
                 pos1 = np.random.randint(num_inputs, MODELLEN-2)
                 pos2 = np.random.randint(pos1, MODELLEN)
                 c1[pos1:pos2] = np.random.randint(0, pos1, size=(pos2-pos1,3))
-            if np.random.rand() < 0.1:
+            if np.random.rand() < 0.05:
                 size = 2**np.random.randint(0, int(np.log2(MODELLEN)-2))
                 pos1 = np.random.randint(num_inputs+size, MODELLEN-size-1)
                 pos2 = np.random.randint(pos1, MODELLEN-size)
                 pos3 = np.random.randint(0, size)
                 c1[pos1+pos3:pos2+pos3] = c1[pos1:pos2]
+                c2[pos1+pos3:pos2+pos3] = c2[pos1:pos2]
+                c3[pos1+pos3:pos2+pos3] = c3[pos1:pos2]
+            if np.random.rand() < 0.05:
+                size = 2**np.random.randint(0, int(np.log2(MODELLEN)-2))
+                pos1 = np.random.randint(num_inputs+size, MODELLEN-size-1)
+                pos2 = np.random.randint(pos1, MODELLEN-size)
+                pos3 = np.random.randint(0, size)
+                c1[pos1+pos3:pos2+pos3] = c1[pos1:pos2]+pos3
                 c2[pos1+pos3:pos2+pos3] = c2[pos1:pos2]
                 c3[pos1+pos3:pos2+pos3] = c3[pos1:pos2]
 
@@ -939,5 +947,5 @@ def run_demo(
 
 # 実行例（まず「ちゃんと動くか」を見る用）
 if __name__ == "__main__":
-    elites = run_demo(MODELLEN=2048, POP=64, iters=10000, samples=2048, last_k=1)
+    elites = run_demo(MODELLEN=2048, POP=128, iters=10000, samples=2048, last_k=1)
     print("done. best elite corr:", max(e[-1] for e in elites))
