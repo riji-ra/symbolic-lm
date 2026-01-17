@@ -670,9 +670,14 @@ def batch_exec_structured_logits_1d(
     # input sids are 0..(num_inputs-1) but here we only feed ONE vector;
     # if you want multiple inputs, stack/partition your x_1d beforehand.
     # For now: sid=0 gets x, others get zeros.
-    outputs[0] = x_1d
-    for j in range(1, min(8, S)):
-        outputs[j] = np.zeros(L, dtype=np.float32)
+    outputs = [None] * S
+
+    # 入力ノードをそのまま渡す
+    for i in range(num_inputs):
+        outputs[i] = x_inputs[i]
+
+    for i in range(num_inputs, S):
+        outputs[i] = None
 
     # compute in topo order
     for sid in topo:
@@ -810,7 +815,7 @@ def run_demo(
 ):
     # number of inputs: we feed only sid=0, but reserve a few to match your style if you want.
     # Here: num_inputs=8 for safety. (sid 0 gets x, others zeros)
-    num_inputs = 8
+    num_inputs = 15
 
     # init genes
     GENES1 = []
@@ -848,9 +853,9 @@ def run_demo(
         targets = []
         for _ in dats:
             gt, score = _
-            x = gt.flatten()  # 1D input
+            x_inputs = gt.astype(np.float32)  # 1D input
             logit = batch_exec_structured_logits_1d(
-                x, node_structs, struct_type, struct_func, struct_ch1, struct_ch2, struct_ch3,
+                x_inputs, node_structs, struct_type, struct_func, struct_ch1, struct_ch2, struct_ch3,
                 struct_alpha, topo, last_k=last_k, restrict=True
             )[:, 0]  # (POP,)
             logits_all.append(logit)
@@ -868,11 +873,11 @@ def run_demo(
 
         rank = np.argsort(losses)  # smaller is better
         best = rank[0]
-        print(f"step {step:4d}  best_corr={corrs[best]: .4f}  best_loss={losses[best]: .4f}")
+        print(f"step {step:4d}  best_corr={corrs[best]: .4f}  best_loss={losses[best]: .4f}  elites={len(elites)}")
 
-        if(oldacc < corrs[best]):
+        if(oldacc > corrs[best]):
             elites.append((deepcopy(GENES1[best]), deepcopy(GENES2[best]), deepcopy(GENES3[best]), float(losses[best])))
-        oldacc = corrs[best]
+            oldacc = corrs[best]
 
         # produce next gen: elitism + crossover/mutation (very simple)
         new1, new2, new3 = [], [], []
