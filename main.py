@@ -811,7 +811,7 @@ def batch_exec_structured_logits_1d(
 def safe_corr(a, b):
     a = np.asarray(a, dtype=np.float64).ravel()
     b = np.asarray(b, dtype=np.float64).ravel()
-    return chatterjee_correlation(a, b).max(0) * chatterjee_correlation(b, a).max(0) * np.abs(np.corrcoef(a, b)[0, 1])
+    return np.abs(np.corrcoef(a, b)[0, 1])
     """if a.size < 2:
         return 0.0
     sa = np.std(a); sb = np.std(b)
@@ -824,7 +824,7 @@ def safe_corr(a, b):
 
 def loss_from_corr(c):
     # 1-c in (0,2], log2 OK; clip for safety
-    return -c
+    return np.log2(1-c)
 
 # =========================
 # Example: your gendata() style
@@ -908,6 +908,7 @@ def run_demo(
 
         # evaluate
         if(step % change_every == 0):
+            oldacc = oldacc + 0.0625
             dats = []
             for _ in range(samples):
                 gt, score = gendata()
