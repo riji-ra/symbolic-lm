@@ -875,6 +875,7 @@ def run_demo(
     iters=50,
     samples=256,
     change_every=8,
+    warmup=128,
 ):
     # number of inputs: we feed only sid=0, but reserve a few to match your style if you want.
     # Here: num_inputs=8 for safety. (sid 0 gets x, others zeros)
@@ -900,15 +901,15 @@ def run_demo(
         # stack population
         G1 = np.stack(GENES1, axis=0)  # (N,MODELLEN,3)
         G2 = np.stack(GENES2, axis=0)  # (N,MODELLEN)
-        G3 = np.stack(np.zeros_like(GENES3), axis=0)  # (N,MODELLEN)
+        G3 = np.stack(GENES3, axis=0)  # (N,MODELLEN)
 
         node_structs, struct_type, struct_func, struct_ch1, struct_ch2, struct_ch3, struct_alpha, idxs, pairs = \
             precompute_structs_numba(G1, G2, G3, len_i0, len_i1, len_i2, num_inputs=num_inputs, last_k=last_k)
         topo = topo_sort_structs_numba_from_arrays(struct_type, struct_ch1, struct_ch2, struct_ch3)
 
         # evaluate
-        if(step % change_every == 0):
-            oldacc = oldacc + 0.0625
+        if(step % change_every == 0 or step > warmup):
+            oldacc += 0.01
             dats = []
             for _ in range(samples):
                 gt, score = gendata()
@@ -941,7 +942,7 @@ def run_demo(
             elites.append((deepcopy(GENES1[best]), deepcopy(GENES2[best]), deepcopy(GENES3[best]), float(losses[best])))
             oldacc = losses[best]
 
-        print(f"{step}, {-losses[best]}, {len(elites)}")
+        print(f"{step}, {-losses[best]}")
 
         # produce next gen: elitism + crossover/mutation (very simple)
         new1, new2, new3 = [], [], []
@@ -968,29 +969,30 @@ def run_demo(
             mix = np.random.uniform(0, 1)
             c3[a:b] = c3[a:b] * mix + GENES3[p2][a:b] * (1-mix)
 
+            a = np.random.uniform(0, 1.25)
             # mutate some refs / ops / alpha
-            if np.random.rand() < 0.75:
+            if np.random.rand() < 0.75 * a:
                 for _ in range(np.random.randint(2, 2**np.random.randint(2, int(np.log2(MODELLEN))))):
                     pos = np.random.randint(num_inputs, MODELLEN)
                     which = np.random.randint(0, 3)
                     c1[pos, which] = np.random.randint(0, pos)  # ensure DAG
-            if np.random.rand() < 0.75:
+            if np.random.rand() < 0.75 * a:
                 for _ in range(np.random.randint(2, 2**np.random.randint(2, int(np.log2(MODELLEN))))):
                     pos = np.random.randint(num_inputs, MODELLEN)
                     c2[pos] = np.random.choice(len_i0 + len_i1 + len_i2, p=T)
-            if np.random.rand() < 0.3:
+            if np.random.rand() < 0.3 * a:
                 for _ in range(np.random.randint(1, 6)):
                     pos = np.random.randint(num_inputs, MODELLEN)
                     c3[pos] = np.clip(c3[pos] + np.random.normal(0, 0.2), 0.0, 1.0)
-            if np.random.rand() < 0.05:
+            if np.random.rand() < 0.05 * a:
                 pos1 = np.random.randint(num_inputs, MODELLEN-2)
                 pos2 = np.random.randint(pos1, MODELLEN)
                 c2[pos1:pos2] = np.random.choice(len_i0 + len_i1 + len_i2, size=(pos2-pos1,), p=T)
-            if np.random.rand() < 0.05:
+            if np.random.rand() < 0.05 * a:
                 pos1 = np.random.randint(num_inputs, MODELLEN-2)
                 pos2 = np.random.randint(pos1, MODELLEN)
                 c1[pos1:pos2] = np.random.randint(0, pos1, size=(pos2-pos1,3))
-            if np.random.rand() < 0.05:
+            if np.random.rand() < 0.05 * a:
                 size = 2**np.random.randint(0, int(np.log2(MODELLEN)-2))
                 pos1 = np.random.randint(num_inputs+size, MODELLEN-size-1)
                 pos2 = np.random.randint(pos1, MODELLEN-size)
@@ -998,7 +1000,7 @@ def run_demo(
                 c1[pos1+pos3:pos2+pos3] = c1[pos1:pos2]
                 c2[pos1+pos3:pos2+pos3] = c2[pos1:pos2]
                 c3[pos1+pos3:pos2+pos3] = c3[pos1:pos2]
-            if np.random.rand() < 0.05:
+            if np.random.rand() < 0.05 * a:
                 size = 2**np.random.randint(0, int(np.log2(MODELLEN)-2))
                 pos1 = np.random.randint(num_inputs+size, MODELLEN-size-1)
                 pos2 = np.random.randint(pos1, MODELLEN-size)
@@ -1006,6 +1008,13 @@ def run_demo(
                 c1[pos1+pos3:pos2+pos3] = c1[pos1:pos2]+pos3
                 c2[pos1+pos3:pos2+pos3] = c2[pos1:pos2]
                 c3[pos1+pos3:pos2+pos3] = c3[pos1:pos2]
+            if np.random.rand() < 0.05 * a:
+                c3 = np.random.uniform(0, 1, size=(MODELLEN,)).astype(np.float32)
+            if np.random.rand() < 0.05 * a:
+                c3 = np.fft.ifft(np.fft.fft(c3) * np.fft.fft(GENES3[rank[np.random.randint(0, POP//3)]]) / np.fft.fft(GENES3[np.random.randint(0, POP)])).real
+            if np.random.rand() < 0.05 * a:
+                c3 = c3 + (GENES3[rank[np.random.randint(0, POP//3)]] - GENES3[np.random.randint(0, POP)]) * np.random.uniform(0, 1.25)
+            c3 = np.maximum(np.minimum(c3, 1), 0)
 
             new1.append(c1); new2.append(c2); new3.append(c3)
 
@@ -1018,5 +1027,5 @@ def run_demo(
 
 # 実行例（まず「ちゃんと動くか」を見る用）
 if __name__ == "__main__":
-    elites = run_demo(MODELLEN=4096, POP=256, iters=10000, samples=4096, last_k=1, change_every=8)
+    elites = run_demo(MODELLEN=16384, POP=256, iters=10000, samples=4096, last_k=1, change_every=8, warmup=1000)
     print("done. best elite corr:", max(e[-1] for e in elites))
