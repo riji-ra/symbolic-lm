@@ -4,7 +4,7 @@ from copy import deepcopy
 import time
 import gc
 import warnings
-from scipy.stats import rankdata
+from scipy.stats import spearmanr
 
 
 def chatterjee_correlation(x, y):
@@ -783,7 +783,7 @@ def batch_exec_structured_logits_1d(
             if s >= 0:
                 need_last[s] = True
 
-    sid_sum = np.zeros(S, dtype=np.float32)
+    sid_mean = np.zeros(S, dtype=np.float32)
     sid_has = np.zeros(S, dtype=np.bool_)
     for s in range(S):
         if not need_last[s]:
@@ -791,9 +791,9 @@ def batch_exec_structured_logits_1d(
         arr = outputs[s]
         if arr is None:
             continue
-        v = float(np.sum(arr))
+        v = float(np.mean(arr))
         if np.isfinite(v):
-            sid_sum[s] = v
+            sid_mean[s] = v
             sid_has[s] = True
 
     logits = np.zeros((N, last_k), dtype=np.float32)
@@ -801,7 +801,7 @@ def batch_exec_structured_logits_1d(
         for j in range(last_k):
             s = int(last_sids[i, j])
             if s >= 0 and sid_has[s]:
-                logits[i, j] = sid_sum[s]
+                logits[i, j] = sid_mean[s]
 
     return logits
 
@@ -811,7 +811,7 @@ def batch_exec_structured_logits_1d(
 def safe_corr(a, b):
     a = np.asarray(a, dtype=np.float64).ravel()
     b = np.asarray(b, dtype=np.float64).ravel()
-    return np.abs(np.corrcoef(a, b)[0, 1])
+    return np.abs(spearmanr(a, b).statistic)
     """if a.size < 2:
         return 0.0
     sa = np.std(a); sb = np.std(b)
@@ -875,7 +875,7 @@ def run_demo(
     iters=50,
     samples=256,
     change_every=8,
-    warmup=128,
+    #warmup=128,
 ):
     # number of inputs: we feed only sid=0, but reserve a few to match your style if you want.
     # Here: num_inputs=8 for safety. (sid 0 gets x, others zeros)
@@ -901,15 +901,14 @@ def run_demo(
         # stack population
         G1 = np.stack(GENES1, axis=0)  # (N,MODELLEN,3)
         G2 = np.stack(GENES2, axis=0)  # (N,MODELLEN)
-        G3 = np.stack(GENES3, axis=0)  # (N,MODELLEN)
+        G3 = np.stack(np.zeros_like(GENES3), axis=0)  # (N,MODELLEN)
 
         node_structs, struct_type, struct_func, struct_ch1, struct_ch2, struct_ch3, struct_alpha, idxs, pairs = \
             precompute_structs_numba(G1, G2, G3, len_i0, len_i1, len_i2, num_inputs=num_inputs, last_k=last_k)
         topo = topo_sort_structs_numba_from_arrays(struct_type, struct_ch1, struct_ch2, struct_ch3)
 
         # evaluate
-        if(step % change_every == 0 or step > warmup):
-            oldacc += 0.01
+        if(step % 8 == 0):
             dats = []
             for _ in range(samples):
                 gt, score = gendata()
@@ -938,9 +937,10 @@ def run_demo(
 
         rank = np.argsort(losses)  # smaller is better
         best = rank[0]
-        if(oldacc > losses[best]):
+        if(oldacc - losses[best] > 0.01):
             elites.append((deepcopy(GENES1[best]), deepcopy(GENES2[best]), deepcopy(GENES3[best]), float(losses[best])))
             oldacc = losses[best]
+        oldacc = oldacc * 0.99 + losses[best] * 0.01
 
         print(f"{step}, {-losses[best]}")
 
@@ -952,9 +952,9 @@ def run_demo(
             new1.append(deepcopy(GENES1[idx]))
             new2.append(deepcopy(GENES2[idx]))
             new3.append(deepcopy(GENES3[idx]))
-        new1.extend([_[0] for _ in elites[-32:]])
-        new2.extend([_[1] for _ in elites[-32:]])
-        new3.extend([_[2] for _ in elites[-32:]])
+        new1.extend([_[0] for _ in elites[-12:]])
+        new2.extend([_[1] for _ in elites[-12:]])
+        new3.extend([_[2] for _ in elites[-12:]])
 
         # rest by crossover
         while len(new1) < POP:
@@ -969,7 +969,7 @@ def run_demo(
             mix = np.random.uniform(0, 1)
             c3[a:b] = c3[a:b] * mix + GENES3[p2][a:b] * (1-mix)
 
-            a = np.random.uniform(0, 1.25)
+            a = 1#np.random.uniform(0, 1.25)
             # mutate some refs / ops / alpha
             if np.random.rand() < 0.75 * a:
                 for _ in range(np.random.randint(2, 2**np.random.randint(2, int(np.log2(MODELLEN))))):
@@ -1008,11 +1008,11 @@ def run_demo(
                 c1[pos1+pos3:pos2+pos3] = c1[pos1:pos2]+pos3
                 c2[pos1+pos3:pos2+pos3] = c2[pos1:pos2]
                 c3[pos1+pos3:pos2+pos3] = c3[pos1:pos2]
-            if np.random.rand() < 0.05 * a:
+            if np.random.rand() < 0.025 * a:
                 c3 = np.random.uniform(0, 1, size=(MODELLEN,)).astype(np.float32)
-            if np.random.rand() < 0.05 * a:
+            if np.random.rand() < 0.025 * a:
                 c3 = np.fft.ifft(np.fft.fft(c3) * np.fft.fft(GENES3[rank[np.random.randint(0, POP//3)]]) / np.fft.fft(GENES3[np.random.randint(0, POP)])).real
-            if np.random.rand() < 0.05 * a:
+            if np.random.rand() < 0.025 * a:
                 c3 = c3 + (GENES3[rank[np.random.randint(0, POP//3)]] - GENES3[np.random.randint(0, POP)]) * np.random.uniform(0, 1.25)
             c3 = np.maximum(np.minimum(c3, 1), 0)
 
@@ -1027,5 +1027,5 @@ def run_demo(
 
 # 実行例（まず「ちゃんと動くか」を見る用）
 if __name__ == "__main__":
-    elites = run_demo(MODELLEN=16384, POP=256, iters=10000, samples=4096, last_k=1, change_every=8, warmup=1000)
+    elites = run_demo(MODELLEN=16384, POP=256, iters=10000, samples=1024, last_k=1, change_every=1)
     print("done. best elite corr:", max(e[-1] for e in elites))
