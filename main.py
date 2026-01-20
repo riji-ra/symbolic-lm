@@ -5,6 +5,10 @@ import time
 import gc
 import warnings
 from scipy.stats import spearmanr
+#from datasets import load_dataset
+
+# Load the high-quality subset
+#data = load_dataset("HuggingFaceTB/finemath", "finemath-4plus", split="train")
 
 
 def chatterjee_correlation(x, y):
@@ -811,7 +815,7 @@ def batch_exec_structured_logits_1d(
 def safe_corr(a, b):
     a = np.asarray(a, dtype=np.float64).ravel()
     b = np.asarray(b, dtype=np.float64).ravel()
-    return np.abs(spearmanr(a, b).statistic)
+    return np.abs(np.corrcoef(a, b)[1, 0])
     """if a.size < 2:
         return 0.0
     sa = np.std(a); sb = np.std(b)
@@ -849,8 +853,8 @@ def generatetekito():
     if enz == 11: return f"{S}-{S2}/{S3}={S - S2//S3}"
     return f"{S}/{S2}*{S3}={int(S/S2*S3)}"
 
-def gendata():
-    at = [A[_] for _ in generatetekito()]
+def gendata(g):
+    at = [A[_] for _ in g]
     s = 1.0
     g = np.random.choice(len(at), len(at), replace=False)
     for i in range(np.random.randint(0, len(at)+1)):
@@ -864,6 +868,8 @@ def gendata():
     return gt, np.float32(s)
 
 history = []
+
+import tqdm
 
 # =========================
 # Minimal GA loop (tiny) to verify "runs"
@@ -907,40 +913,39 @@ def run_demo(
             precompute_structs_numba(G1, G2, G3, len_i0, len_i1, len_i2, num_inputs=num_inputs, last_k=last_k)
         topo = topo_sort_structs_numba_from_arrays(struct_type, struct_ch1, struct_ch2, struct_ch3)
 
-        # evaluate
-        if(step % 8 == 0):
-            dats = []
-            for _ in range(samples):
-                gt, score = gendata()
-                dats.append((gt, score))
-        logits_all = []
-        targets = []
-        for _ in dats:
-            gt, score = _
-            x_inputs = gt.astype(np.float32)  # 1D input
-            logit = batch_exec_structured_logits_1d(
-                x_inputs, node_structs, struct_type, struct_func, struct_ch1, struct_ch2, struct_ch3,
-                struct_alpha, topo, last_k=last_k, restrict=True
-            )[:, 0]  # (POP,)
-            logits_all.append(logit)
-            targets.append(score)
-
-        logits_all = np.asarray(logits_all, dtype=np.float32)  # (samples, POP)
-        targets = np.asarray(targets, dtype=np.float32)        # (samples,)
-
         losses = np.zeros(POP, dtype=np.float64)
         corrs = np.zeros(POP, dtype=np.float64)
+        dats = []
+        for __ in tqdm.tqdm(range(samples//32)) if step<1 else range(samples//32):
+            logits_all = []
+            targets = []
+
+            gp = generatetekito()
+            for _ in range(32):
+                gt, score = gendata(gp)
+                x_inputs = gt.astype(np.float32)  # 1D input
+                logit = batch_exec_structured_logits_1d(
+                    x_inputs, node_structs, struct_type, struct_func, struct_ch1, struct_ch2, struct_ch3,
+                    struct_alpha, topo, last_k=last_k, restrict=True
+                )[:, 0]  # (POP,)
+                logits_all.append(logit)
+                targets.append(score)
+
+            logits_all = np.asarray(logits_all, dtype=np.float32)  # (samples, POP)
+            targets = np.asarray(targets, dtype=np.float32)        # (samples,)
+
+            for i in range(POP):
+                c = safe_corr(logits_all[:, i], targets)
+                corrs[i] += c
+                losses[i] += loss_from_corr(c)
         for i in range(POP):
-            c = safe_corr(logits_all[:, i], targets)
-            corrs[i] = c
-            losses[i] = loss_from_corr(c)
+            losses[i] /= samples/32
 
         rank = np.argsort(losses)  # smaller is better
         best = rank[0]
-        if(oldacc - losses[best] > 0.01):
+        if(oldacc - losses[best] > 0.001):
             elites.append((deepcopy(GENES1[best]), deepcopy(GENES2[best]), deepcopy(GENES3[best]), float(losses[best])))
             oldacc = losses[best]
-        oldacc = oldacc * 0.99 + losses[best] * 0.01
 
         print(f"{step}, {-losses[best]}")
 
@@ -969,7 +974,7 @@ def run_demo(
             mix = np.random.uniform(0, 1)
             c3[a:b] = c3[a:b] * mix + GENES3[p2][a:b] * (1-mix)
 
-            a = 1#np.random.uniform(0, 1.25)
+            a = 1#np.random.uniform(0, 1) ** 2
             # mutate some refs / ops / alpha
             if np.random.rand() < 0.75 * a:
                 for _ in range(np.random.randint(2, 2**np.random.randint(2, int(np.log2(MODELLEN))))):
@@ -1027,5 +1032,5 @@ def run_demo(
 
 # 実行例（まず「ちゃんと動くか」を見る用）
 if __name__ == "__main__":
-    elites = run_demo(MODELLEN=16384, POP=256, iters=10000, samples=1024, last_k=1, change_every=1)
+    elites = run_demo(MODELLEN=4096, POP=512, iters=10000, samples=1024, last_k=1, change_every=1)
     print("done. best elite corr:", max(e[-1] for e in elites))
