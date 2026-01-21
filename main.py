@@ -815,7 +815,7 @@ def batch_exec_structured_logits_1d(
 def safe_corr(a, b):
     a = np.asarray(a, dtype=np.float64).ravel()
     b = np.asarray(b, dtype=np.float64).ravel()
-    return np.abs(np.corrcoef(a, b)[1, 0])
+    return np.abs(np.corrcoef(a, b)[0, 1])
     """if a.size < 2:
         return 0.0
     sa = np.std(a); sb = np.std(b)
@@ -835,9 +835,9 @@ def loss_from_corr(c):
 # =========================
 A = {"0":0,"1":1,"2":2,"3":3,"4":4,"5":5,"6":6,"7":7,"8":8,"9":9,"+":10,"-":11,"*":12,"/":13,"=":14}
 def generatetekito():
-    S = int(np.random.randint(1, 2 ** np.random.randint(4, 12)) * (np.random.randint(0, 1) * 2 - 1))
-    S2 = int(np.random.randint(1, 2 ** np.random.randint(4, 12)) * (np.random.randint(0, 1) * 2 - 1))
-    S3 = int(np.random.randint(1, 2 ** np.random.randint(4, 12)) * (np.random.randint(0, 1) * 2 - 1))
+    S = int(np.random.randint(1, 2 ** np.random.randint(4, 32)))
+    S2 = int(np.random.randint(1, 2 ** np.random.randint(4, 32)))
+    S3 = int(np.random.randint(1, 2 ** np.random.randint(4, 32)))
     enz = np.random.randint(0, 13)
     if enz == 0:  return f"{S}+{S2}={S+S2}"
     if enz == 1:  return f"{S}-{S2}={S-S2}"
@@ -853,14 +853,14 @@ def generatetekito():
     if enz == 11: return f"{S}-{S2}/{S3}={S - S2//S3}"
     return f"{S}/{S2}*{S3}={int(S/S2*S3)}"
 
-def gendata(g):
+def gendata(g, tt):
     at = [A[_] for _ in g]
-    s = 1.0
+    s = ((len(at) - tt) / len(at))
     g = np.random.choice(len(at), len(at), replace=False)
-    for i in range(np.random.randint(0, len(at)+1)):
+    for i in range(tt):
         t = np.random.randint(0, 15)
-        if t != at[g[i]]:
-            s -= 1.0 / len(at)
+        while t == at[g[i]]:
+            t = np.random.randint(0, 15)
         at[g[i]] = t
     gt = np.zeros((15, len(at)), dtype=np.float32)
     for j in range(len(at)):
@@ -880,9 +880,18 @@ def run_demo(
     last_k=1,
     iters=50,
     samples=256,
+    dataset=16384,
     change_every=8,
     #warmup=128,
 ):
+    traindats = []
+    for __ in tqdm.tqdm(range(dataset)):
+        gp = generatetekito()
+        datsd = []
+        for change_every in range(len(gp)):
+            gt, score = gendata(gp, change_every)
+            datsd.append((gt, score))
+        traindats.append(datsd)
     # number of inputs: we feed only sid=0, but reserve a few to match your style if you want.
     # Here: num_inputs=8 for safety. (sid 0 gets x, others zeros)
     num_inputs = 15
@@ -901,7 +910,7 @@ def run_demo(
 
     elites = []
     dats = []
-    oldacc = 0
+    oldacc = np.zeros(dataset // samples)
 
     for step in range(iters):
         # stack population
@@ -913,16 +922,13 @@ def run_demo(
             precompute_structs_numba(G1, G2, G3, len_i0, len_i1, len_i2, num_inputs=num_inputs, last_k=last_k)
         topo = topo_sort_structs_numba_from_arrays(struct_type, struct_ch1, struct_ch2, struct_ch3)
 
-        losses = np.zeros(POP, dtype=np.float64)
-        corrs = np.zeros(POP, dtype=np.float64)
-        dats = []
-        for __ in tqdm.tqdm(range(samples//32)) if step<1 else range(samples//32):
+        # evaluate
+        dats = traindats[(step % (dataset // samples)) * samples : (step % (dataset // samples)) * samples + samples]
+        for das in tqdm.tqdm(dats) if step < 1 else dats:
             logits_all = []
             targets = []
-
-            gp = generatetekito()
-            for _ in range(32):
-                gt, score = gendata(gp)
+            for _ in das:
+                gt, score = _
                 x_inputs = gt.astype(np.float32)  # 1D input
                 logit = batch_exec_structured_logits_1d(
                     x_inputs, node_structs, struct_type, struct_func, struct_ch1, struct_ch2, struct_ch3,
@@ -934,20 +940,22 @@ def run_demo(
             logits_all = np.asarray(logits_all, dtype=np.float32)  # (samples, POP)
             targets = np.asarray(targets, dtype=np.float32)        # (samples,)
 
+            losses = np.zeros(POP, dtype=np.float64)
+            corrs = np.zeros(POP, dtype=np.float64)
             for i in range(POP):
                 c = safe_corr(logits_all[:, i], targets)
                 corrs[i] += c
-                losses[i] += loss_from_corr(c)
-        for i in range(POP):
-            losses[i] /= samples/32
+                losses[i] -= np.abs(c)
+        losses /= len(dats)
+        corrs /= len(dats)
 
         rank = np.argsort(losses)  # smaller is better
         best = rank[0]
-        if(oldacc - losses[best] > 0.001):
-            elites.append((deepcopy(GENES1[best]), deepcopy(GENES2[best]), deepcopy(GENES3[best]), float(losses[best])))
-            oldacc = losses[best]
 
-        print(f"{step}, {-losses[best]}")
+        print(f"{step}, {-losses[best]}, {-oldacc[step % (dataset // samples)]}")
+        if(oldacc[step % (dataset // samples)] - losses[best] > 0.001):
+            elites.append((deepcopy(GENES1[best]), deepcopy(GENES2[best]), deepcopy(GENES3[best]), float(losses[best])))
+            oldacc[step % (dataset // samples)] = losses[best]
 
         # produce next gen: elitism + crossover/mutation (very simple)
         new1, new2, new3 = [], [], []
@@ -957,9 +965,14 @@ def run_demo(
             new1.append(deepcopy(GENES1[idx]))
             new2.append(deepcopy(GENES2[idx]))
             new3.append(deepcopy(GENES3[idx]))
-        new1.extend([_[0] for _ in elites[-12:]])
-        new2.extend([_[1] for _ in elites[-12:]])
-        new3.extend([_[2] for _ in elites[-12:]])
+        new1.extend([_[0] for _ in elites[-6:]])
+        new2.extend([_[1] for _ in elites[-6:]])
+        new3.extend([_[2] for _ in elites[-6:]])
+        for _ in range(6):
+            r = np.random.randint(0, len(elites))
+            new1.append(deepcopy(elites[r][0]))
+            new2.append(deepcopy(elites[r][1]))
+            new3.append(deepcopy(elites[r][2]))
 
         # rest by crossover
         while len(new1) < POP:
@@ -1026,11 +1039,12 @@ def run_demo(
         GENES1, GENES2, GENES3 = new1, new2, new3
         gc.collect()
         history.append(losses[best])
-        np.savez(f"gen.npz", GENES1=GENES1, GENES2=GENES2, GENES3=GENES3, history=history)
+        if(step%100 == 0):
+            np.savez(f"gen.npz", GENES1=GENES1, GENES2=GENES2, GENES3=GENES3, history=history)
 
     return elites
 
 # 実行例（まず「ちゃんと動くか」を見る用）
 if __name__ == "__main__":
-    elites = run_demo(MODELLEN=4096, POP=512, iters=10000, samples=1024, last_k=1, change_every=1)
+    elites = run_demo(MODELLEN=4096, POP=512, iters=10000, samples=32, last_k=1, change_every=1)
     print("done. best elite corr:", max(e[-1] for e in elites))
