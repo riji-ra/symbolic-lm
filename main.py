@@ -8,7 +8,8 @@ from scipy.stats import spearmanr
 #from datasets import load_dataset
 
 # Load the high-quality subset
-#data = load_dataset("HuggingFaceTB/finemath", "finemath-4plus", split="train")
+#data = load_dataset("HuggingFaceTB/finemath", "finemath-4plus")
+#print(data[0])
 
 
 def chatterjee_correlation(x, y):
@@ -206,6 +207,8 @@ funcs_3 = [
     lambda x, y, z: ggg(attn_poly5_fast(x**5, y**5, z**5)),
     lambda x, y, z: attn_poly11_fast(x, y, z),
     lambda x, y, z: gggg(attn_poly11_fast(x**11, y**11, z**11)),
+    lambda x, y, z: np.take(np.take(x, np.argsort(y)), np.argsort(np.argsort(z))),
+    lambda x, y, z: np.take(TT(np.take(x, np.argsort(y))), np.argsort(np.argsort(z))),
 ]
 
 i0t = funcs_1
@@ -217,7 +220,7 @@ len_i2 = len(i2t)
 
 def build_T_distribution_1d(
     i0t, i1t, i2t,
-    L=512,             # 1Dベクトル長
+    L=64,             # 1Dベクトル長
     repeats=80,        # 1関数あたりの平均化回数（重いなら下げる）
     warmup=5,          # ウォームアップ回数
     power=0.7,         # 元コードの 0.7
@@ -880,18 +883,15 @@ def run_demo(
     last_k=1,
     iters=50,
     samples=256,
-    dataset=4096,
+    dataset=131072,
     change_every=8,
     #warmup=128,
 ):
     traindats = []
     for __ in tqdm.tqdm(range(dataset)):
         gp = generatetekito()
-        datsd = []
-        for change_every in range(len(gp)):
-            gt, score = gendata(gp, change_every)
-            datsd.append((gt, score))
-        traindats.append(datsd)
+        gt, score = gendata(gp, np.random.randint(1, len(gp)))
+        traindats.append((gt, score))
     # number of inputs: we feed only sid=0, but reserve a few to match your style if you want.
     # Here: num_inputs=8 for safety. (sid 0 gets x, others zeros)
     num_inputs = 15
@@ -927,29 +927,26 @@ def run_demo(
         corrs = np.zeros(POP, dtype=np.float64)
         # evaluate
         dats = traindats[(step % (dataset // samples)) * samples : (step % (dataset // samples)) * samples + samples]
-        for das in tqdm.tqdm(dats) if step < 1 else dats:
-            logits_all = []
-            targets = []
-            for _ in das:
-                gt, score = _
-                x_inputs = gt.astype(np.float32)  # 1D input
-                logit = batch_exec_structured_logits_1d(
-                    x_inputs, node_structs, struct_type, struct_func, struct_ch1, struct_ch2, struct_ch3,
-                    struct_alpha, topo, last_k=last_k, restrict=True
-                )[:, 0]  # (POP,)
-                logits_all.append(logit)
-                targets.append(score)
+        logits_all = []
+        targets = []
+        for _ in dats:
+            gt, score = _
+            x_inputs = gt.astype(np.float32)  # 1D input
+            logit = batch_exec_structured_logits_1d(
+                x_inputs, node_structs, struct_type, struct_func, struct_ch1, struct_ch2, struct_ch3,
+                struct_alpha, topo, last_k=last_k, restrict=True
+            )[:, 0]  # (POP,)
+            logits_all.append(logit)
+            targets.append(score)
 
-            logits_all = np.asarray(logits_all, dtype=np.float32)  # (samples, POP)
-            targets = np.asarray(targets, dtype=np.float32)        # (samples,)
+        logits_all = np.asarray(logits_all, dtype=np.float32)  # (samples, POP)
+        targets = np.asarray(targets, dtype=np.float32)        # (samples,)
 
-            for i in range(POP):
-                c = safe_corr(logits_all[:, i], targets)
-                corrs[i] += c
-                losses[i] -= c
-        losses /= len(dats)
-        corrs /= len(dats)
-
+        for i in range(POP):
+            c = safe_corr(logits_all[:, i], targets)
+            corrs[i] += c
+            losses[i] -= c
+        
         rank = np.argsort(losses)  # smaller is better
         best = rank[0]
 
@@ -957,10 +954,10 @@ def run_demo(
             idhk = -losses[best]
         idhk = 0.9 * idhk + 0.1 * -losses[best]
 
-        print(f"{step}, {-losses[best]}, {-oldacc[step % (dataset // samples)]}, {idhk}")
-        if(oldacc[step % (dataset // samples)] - losses[best] > 0.001):
+        if(oldacc[step % (dataset // samples)] - losses[best] > 1e-12):
             elites.append((deepcopy(GENES1[best]), deepcopy(GENES2[best]), deepcopy(GENES3[best]), float(losses[best])))
             oldacc[step % (dataset // samples)] = losses[best]
+        print(f"{step}, {-losses[best]}, {-np.sum(oldacc) / min(step+1, dataset // samples)}")
 
         # produce next gen: elitism + crossover/mutation (very simple)
         new1, new2, new3 = [], [], []
@@ -1051,5 +1048,5 @@ def run_demo(
 
 # 実行例（まず「ちゃんと動くか」を見る用）
 if __name__ == "__main__":
-    elites = run_demo(MODELLEN=4096, POP=128, iters=10000, samples=64, last_k=1, change_every=1)
+    elites = run_demo(MODELLEN=8192, POP=256, iters=10000, samples=2048, last_k=1, change_every=1)
     print("done. best elite corr:", max(e[-1] for e in elites))
