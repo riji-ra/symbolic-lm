@@ -815,7 +815,7 @@ def batch_exec_structured_logits_1d(
 def safe_corr(a, b):
     a = np.asarray(a, dtype=np.float64).ravel()
     b = np.asarray(b, dtype=np.float64).ravel()
-    return np.abs(np.corrcoef(a, b)[0, 1])
+    return spearmanr(a, b).correlation
     """if a.size < 2:
         return 0.0
     sa = np.std(a); sb = np.std(b)
@@ -880,7 +880,7 @@ def run_demo(
     last_k=1,
     iters=50,
     samples=256,
-    dataset=16384,
+    dataset=4096,
     change_every=8,
     #warmup=128,
 ):
@@ -897,6 +897,7 @@ def run_demo(
     num_inputs = 15
 
     # init genes
+    idhk = 0
     GENES1 = []
     GENES2 = []
     GENES3 = []
@@ -922,6 +923,8 @@ def run_demo(
             precompute_structs_numba(G1, G2, G3, len_i0, len_i1, len_i2, num_inputs=num_inputs, last_k=last_k)
         topo = topo_sort_structs_numba_from_arrays(struct_type, struct_ch1, struct_ch2, struct_ch3)
 
+        losses = np.zeros(POP, dtype=np.float64)
+        corrs = np.zeros(POP, dtype=np.float64)
         # evaluate
         dats = traindats[(step % (dataset // samples)) * samples : (step % (dataset // samples)) * samples + samples]
         for das in tqdm.tqdm(dats) if step < 1 else dats:
@@ -940,19 +943,21 @@ def run_demo(
             logits_all = np.asarray(logits_all, dtype=np.float32)  # (samples, POP)
             targets = np.asarray(targets, dtype=np.float32)        # (samples,)
 
-            losses = np.zeros(POP, dtype=np.float64)
-            corrs = np.zeros(POP, dtype=np.float64)
             for i in range(POP):
                 c = safe_corr(logits_all[:, i], targets)
                 corrs[i] += c
-                losses[i] -= np.abs(c)
+                losses[i] -= c
         losses /= len(dats)
         corrs /= len(dats)
 
         rank = np.argsort(losses)  # smaller is better
         best = rank[0]
 
-        print(f"{step}, {-losses[best]}, {-oldacc[step % (dataset // samples)]}")
+        if(step == 0):
+            idhk = -losses[best]
+        idhk = 0.9 * idhk + 0.1 * -losses[best]
+
+        print(f"{step}, {-losses[best]}, {-oldacc[step % (dataset // samples)]}, {idhk}")
         if(oldacc[step % (dataset // samples)] - losses[best] > 0.001):
             elites.append((deepcopy(GENES1[best]), deepcopy(GENES2[best]), deepcopy(GENES3[best]), float(losses[best])))
             oldacc[step % (dataset // samples)] = losses[best]
@@ -1046,5 +1051,5 @@ def run_demo(
 
 # 実行例（まず「ちゃんと動くか」を見る用）
 if __name__ == "__main__":
-    elites = run_demo(MODELLEN=4096, POP=512, iters=10000, samples=32, last_k=1, change_every=1)
+    elites = run_demo(MODELLEN=4096, POP=128, iters=10000, samples=64, last_k=1, change_every=1)
     print("done. best elite corr:", max(e[-1] for e in elites))
