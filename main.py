@@ -4,7 +4,7 @@ from copy import deepcopy
 import time
 import gc
 import warnings
-from scipy.stats import spearmanr
+from scipy.stats import spearmanr, rankdata
 #from datasets import load_dataset
 
 # Load the high-quality subset
@@ -818,7 +818,7 @@ def batch_exec_structured_logits_1d(
 def safe_corr(a, b):
     a = np.asarray(a, dtype=np.float64).ravel()
     b = np.asarray(b, dtype=np.float64).ravel()
-    return spearmanr(a, b).correlation
+    return np.sqrt(spearmanr(a, b).correlation * np.sqrt(chatterjee_correlation(a, b).max(0) * chatterjee_correlation(b, a).max(0)))
     """if a.size < 2:
         return 0.0
     sa = np.std(a); sb = np.std(b)
