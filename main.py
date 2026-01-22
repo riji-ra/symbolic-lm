@@ -201,14 +201,24 @@ funcs_3 = [
     lambda x, y, z: x + y - z,
     lambda x, y, z: np.sqrt(x ** 2 + y ** 2 + z ** 2),
     lambda x, y, z: np.fft.ifft(np.fft.fft(x) * np.fft.fft(y) / (np.fft.fft(z) + 1e-12)).real,
+    lambda x, y, z: np.fft.ifft(np.fft.fft(x) * np.fft.fft(np.tanh(y)) / (np.fft.fft(np.tanh(z)) + 1e-12)).real,
+    lambda x, y, z: np.fft.ifft(np.fft.fft(x) * np.fft.fft(np.tanh(y)+1) / (np.fft.fft(np.tanh(z)+1) + 1e-12)).real,
     lambda x, y, z: attn_poly3_fast(x, y, z),
     lambda x, y, z: gg(attn_poly3_fast(x**3, y**3, z**3)),
+    lambda x, y, z: attn_poly3_fast(x**3, y**3, z),
+    lambda x, y, z: gg(attn_poly3_fast(x, y**3, z)),
     lambda x, y, z: attn_poly5_fast(x, y, z),
     lambda x, y, z: ggg(attn_poly5_fast(x**5, y**5, z**5)),
+    lambda x, y, z: attn_poly5_fast(x**5, y**5, z),
+    lambda x, y, z: ggg(attn_poly5_fast(x, y**5, z)),
     lambda x, y, z: attn_poly11_fast(x, y, z),
     lambda x, y, z: gggg(attn_poly11_fast(x**11, y**11, z**11)),
+    lambda x, y, z: attn_poly11_fast(x**11, y**11, z),
+    lambda x, y, z: gggg(attn_poly11_fast(x, y**11, z)),
     lambda x, y, z: np.take(np.take(x, np.argsort(y)), np.argsort(np.argsort(z))),
     lambda x, y, z: np.take(TT(np.take(x, np.argsort(y))), np.argsort(np.argsort(z))),
+    lambda x, y, z: np.take(TT(TT(np.take(x, np.argsort(y)))), np.argsort(np.argsort(z))),
+    lambda x, y, z: np.take(TT2(np.take(x, np.argsort(y))), np.argsort(np.argsort(z))),
 ]
 
 i0t = funcs_1
@@ -223,7 +233,7 @@ def build_T_distribution_1d(
     L=64,             # 1Dベクトル長
     repeats=80,        # 1関数あたりの平均化回数（重いなら下げる）
     warmup=5,          # ウォームアップ回数
-    power=0.7,         # 元コードの 0.7
+    power=0.5,         # 元コードの 0.5
     seed=0,
     eps=1e-12,
 ):
@@ -678,7 +688,7 @@ def batch_exec_structured_logits_1d(
     struct_ch3,
     struct_alpha,
     topo,
-    last_k=1,
+    last_k=15,
     restrict=True,
 ):
     x_inputs = np.asarray(x_inputs, dtype=np.float32)
@@ -790,7 +800,7 @@ def batch_exec_structured_logits_1d(
             if s >= 0:
                 need_last[s] = True
 
-    sid_mean = np.zeros(S, dtype=np.float32)
+    sid_mean = np.zeros((S, len(x_inputs[0])), dtype=np.float32)
     sid_has = np.zeros(S, dtype=np.bool_)
     for s in range(S):
         if not need_last[s]:
@@ -798,12 +808,10 @@ def batch_exec_structured_logits_1d(
         arr = outputs[s]
         if arr is None:
             continue
-        v = float(np.mean(arr))
-        if np.isfinite(v):
-            sid_mean[s] = v
-            sid_has[s] = True
+        sid_mean[s] = arr
+        sid_has[s] = True
 
-    logits = np.zeros((N, last_k), dtype=np.float32)
+    logits = np.zeros((N, last_k, len(x_inputs[0])), dtype=np.float32)
     for i in range(N):
         for j in range(last_k):
             s = int(last_sids[i, j])
@@ -818,7 +826,7 @@ def batch_exec_structured_logits_1d(
 def safe_corr(a, b):
     a = np.asarray(a, dtype=np.float64).ravel()
     b = np.asarray(b, dtype=np.float64).ravel()
-    return np.sqrt(spearmanr(a, b).correlation * np.sqrt(chatterjee_correlation(a, b).max(0) * chatterjee_correlation(b, a).max(0)))
+    return np.abs(np.corrcoef(a, b)[1, 0]) * np.abs(spearmanr(a, b).correlation) * chatterjee_correlation(a, b).max(0) * chatterjee_correlation(b, a).max(0)
     """if a.size < 2:
         return 0.0
     sa = np.std(a); sb = np.std(b)
@@ -857,18 +865,21 @@ def generatetekito():
     return f"{S}/{S2}*{S3}={int(S/S2*S3)}"
 
 def gendata(g, tt):
+    atc = [A[_] for _ in g]
     at = [A[_] for _ in g]
-    s = ((len(at) - tt) / len(at))
-    g = np.random.choice(len(at), len(at), replace=False)
+    #s = ((len(at) - tt) / len(at))
+    #g = np.random.choice(len(at), len(at), replace=False)
     for i in range(tt):
-        t = np.random.randint(0, 15)
-        while t == at[g[i]]:
-            t = np.random.randint(0, 15)
-        at[g[i]] = t
+        t = np.random.randint(0, len(g))
+        #while t == at[g[i]]:
+        #    t = np.random.randint(0, 15)
+        at[t] = -1
     gt = np.zeros((15, len(at)), dtype=np.float32)
     for j in range(len(at)):
+        if at[j] == -1:
+            continue
         gt[at[j], j] = 1.0
-    return gt, np.float32(s)
+    return gt, atc
 
 history = []
 
@@ -880,7 +891,7 @@ import tqdm
 def run_demo(
     MODELLEN=2048,
     POP=32,
-    last_k=1,
+    last_k=15,
     iters=50,
     samples=256,
     dataset=131072,
@@ -898,13 +909,16 @@ def run_demo(
 
     # init genes
     idhk = 0
+    idhk2 = 0
     GENES1 = []
     GENES2 = []
     GENES3 = []
     for _ in range(POP):
-        G1 = np.abs((1 - np.random.uniform(0, 1, (MODELLEN, 3))) * (np.arange(MODELLEN)[:, None]))
+        G1 = np.abs((1 - np.random.uniform(0, 1, (MODELLEN, 3))**1.25) * (np.arange(MODELLEN)[:, None]))
         G2 = np.random.choice(len_i0 + len_i1 + len_i2, size=(MODELLEN,), p=T)
         G3 = np.random.uniform(0, 1, size=(MODELLEN,)).astype(np.float32)
+        G1[MODELLEN-15:, 0] = np.arange(15)
+        G2[MODELLEN-15:] = 34
         GENES1.append(G1.astype(np.int64))
         GENES2.append(G2.astype(np.int64))
         GENES3.append(G3.astype(np.float32))
@@ -912,6 +926,7 @@ def run_demo(
     elites = []
     dats = []
     oldacc = np.zeros(dataset // samples)
+    signp = lambda x : np.mean(np.sign(0.5 - np.abs(x)) * 0.5 + 0.5)
 
     for step in range(iters):
         # stack population
@@ -927,37 +942,32 @@ def run_demo(
         corrs = np.zeros(POP, dtype=np.float64)
         # evaluate
         dats = traindats[(step % (dataset // samples)) * samples : (step % (dataset // samples)) * samples + samples]
-        logits_all = []
-        targets = []
-        for _ in dats:
+        for _ in dats if step>0 else tqdm.tqdm(dats):
             gt, score = _
             x_inputs = gt.astype(np.float32)  # 1D input
             logit = batch_exec_structured_logits_1d(
                 x_inputs, node_structs, struct_type, struct_func, struct_ch1, struct_ch2, struct_ch3,
                 struct_alpha, topo, last_k=last_k, restrict=True
-            )[:, 0]  # (POP,)
-            logits_all.append(logit)
-            targets.append(score)
+            )
+            p = np.argsort(logit, axis=1)
+            for i in range(POP):
+                for _ in range(15):
+                    losses[i] -= signp(p[i, _, :] - score) / (_+1)**2
+        losses /= len(dats)
 
-        logits_all = np.asarray(logits_all, dtype=np.float32)  # (samples, POP)
-        targets = np.asarray(targets, dtype=np.float32)        # (samples,)
-
-        for i in range(POP):
-            c = safe_corr(logits_all[:, i], targets)
-            corrs[i] += c
-            losses[i] -= c
-        
         rank = np.argsort(losses)  # smaller is better
         best = rank[0]
 
         if(step == 0):
             idhk = -losses[best]
-        idhk = 0.9 * idhk + 0.1 * -losses[best]
+            idhk2 = -losses[best]
+        idhk = 0.99 * idhk + 0.01 * -losses[best]
+        idhk2 = 0.99 * idhk2 + 0.01 * idhk
 
+        print(f"{step}, {-losses[best]}, {-oldacc[step % (dataset // samples)]}, {idhk * 2 - idhk2}")
         if(oldacc[step % (dataset // samples)] - losses[best] > 1e-12):
             elites.append((deepcopy(GENES1[best]), deepcopy(GENES2[best]), deepcopy(GENES3[best]), float(losses[best])))
             oldacc[step % (dataset // samples)] = losses[best]
-        print(f"{step}, {-losses[best]}, {-np.sum(oldacc) / min(step+1, dataset // samples)}")
 
         # produce next gen: elitism + crossover/mutation (very simple)
         new1, new2, new3 = [], [], []
@@ -996,6 +1006,12 @@ def run_demo(
                     pos = np.random.randint(num_inputs, MODELLEN)
                     which = np.random.randint(0, 3)
                     c1[pos, which] = np.random.randint(0, pos)  # ensure DAG
+            if np.random.rand() < 0.75 * a:
+                for _ in range(np.random.randint(1, 15)):
+                    pos = np.random.randint(MODELLEN-15, MODELLEN)
+                    which = np.random.randint(0, 3)
+                    c1[pos, which] = np.random.randint(0, pos)
+                    c2[pos] = np.random.choice(len_i0 + len_i1 + len_i2, p=T)
             if np.random.rand() < 0.75 * a:
                 for _ in range(np.random.randint(2, 2**np.random.randint(2, int(np.log2(MODELLEN))))):
                     pos = np.random.randint(num_inputs, MODELLEN)
@@ -1048,5 +1064,5 @@ def run_demo(
 
 # 実行例（まず「ちゃんと動くか」を見る用）
 if __name__ == "__main__":
-    elites = run_demo(MODELLEN=8192, POP=256, iters=10000, samples=2048, last_k=1, change_every=1)
+    elites = run_demo(MODELLEN=15**3, POP=256, iters=10000, samples=64, change_every=1)
     print("done. best elite corr:", max(e[-1] for e in elites))
