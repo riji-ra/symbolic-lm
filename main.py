@@ -201,14 +201,23 @@ funcs_3 = [
     lambda x, y, z: x + y - z,
     lambda x, y, z: np.sqrt(x ** 2 + y ** 2 + z ** 2),
     lambda x, y, z: np.fft.ifft(np.fft.fft(x) * np.fft.fft(y) / (np.fft.fft(z) + 1e-12)).real,
-    lambda x, y, z: attn_poly3_fast(x, y, z),
-    lambda x, y, z: gg(attn_poly3_fast(x**3, y**3, z**3)),
+    lambda x, y, z: np.fft.ifft(np.fft.fft(x) * np.fft.fft(np.tanh(y)) / (np.fft.fft(np.tanh(z)) + 1e-12)).real,
+    lambda x, y, z: np.fft.ifft(np.fft.fft(x) * np.fft.fft(np.tanh(y)+1) / (np.fft.fft(np.tanh(z)+1) + 1e-12)).real,
+    lambda x, y, z: attn_poly3_fast(x**3, y**3, z),
+    lambda x, y, z: gg(attn_poly3_fast(x, y**3, z)),
     lambda x, y, z: attn_poly5_fast(x, y, z),
     lambda x, y, z: ggg(attn_poly5_fast(x**5, y**5, z**5)),
+    lambda x, y, z: attn_poly5_fast(x**5, y**5, z),
+    lambda x, y, z: ggg(attn_poly5_fast(x, y**5, z)),
     lambda x, y, z: attn_poly11_fast(x, y, z),
     lambda x, y, z: gggg(attn_poly11_fast(x**11, y**11, z**11)),
+    lambda x, y, z: attn_poly11_fast(x**11, y**11, z),
+    lambda x, y, z: gggg(attn_poly11_fast(x, y**11, z)),
     lambda x, y, z: np.take(np.take(x, np.argsort(y)), np.argsort(np.argsort(z))),
     lambda x, y, z: np.take(TT(np.take(x, np.argsort(y))), np.argsort(np.argsort(z))),
+    lambda x, y, z: np.take(TT(TT(np.take(x, np.argsort(y)))), np.argsort(np.argsort(z))),
+    lambda x, y, z: np.take(TT2(np.take(x, np.argsort(y))), np.argsort(np.argsort(z))),
+    lambda x, y, z: np.take(TT2(TT2(np.take(x, np.argsort(y)))), np.argsort(np.argsort(z))),
 ]
 
 i0t = funcs_1
@@ -818,7 +827,7 @@ def batch_exec_structured_logits_1d(
 def safe_corr(a, b):
     a = np.asarray(a, dtype=np.float64).ravel()
     b = np.asarray(b, dtype=np.float64).ravel()
-    return np.sqrt(spearmanr(a, b).correlation * np.sqrt(chatterjee_correlation(a, b).max(0) * chatterjee_correlation(b, a).max(0)))
+    return np.abs(np.corrcoef(a, b)[0, 1]) * np.abs(spearmanr(a, b).correlation) * chatterjee_correlation(a, b).max(0) * chatterjee_correlation(b, a).max(0)
     """if a.size < 2:
         return 0.0
     sa = np.std(a); sb = np.std(b)
@@ -902,7 +911,7 @@ def run_demo(
     GENES2 = []
     GENES3 = []
     for _ in range(POP):
-        G1 = np.abs((1 - np.random.uniform(0, 1, (MODELLEN, 3))) * (np.arange(MODELLEN)[:, None]))
+        G1 = np.abs((1 - np.random.uniform(0, 1, (MODELLEN, 3))**1.25) * (np.arange(MODELLEN)[:, None]))
         G2 = np.random.choice(len_i0 + len_i1 + len_i2, size=(MODELLEN,), p=T)
         G3 = np.random.uniform(0, 1, size=(MODELLEN,)).astype(np.float32)
         GENES1.append(G1.astype(np.int64))
@@ -929,7 +938,7 @@ def run_demo(
         dats = traindats[(step % (dataset // samples)) * samples : (step % (dataset // samples)) * samples + samples]
         logits_all = []
         targets = []
-        for _ in dats:
+        for _ in tqdm.tqdm(dats) if step<1 else dats:
             gt, score = _
             x_inputs = gt.astype(np.float32)  # 1D input
             logit = batch_exec_structured_logits_1d(
@@ -952,12 +961,12 @@ def run_demo(
 
         if(step == 0):
             idhk = -losses[best]
-        idhk = 0.9 * idhk + 0.1 * -losses[best]
+        idhk = 0.95 * idhk + 0.05 * -losses[best]
 
         if(oldacc[step % (dataset // samples)] - losses[best] > 1e-12):
             elites.append((deepcopy(GENES1[best]), deepcopy(GENES2[best]), deepcopy(GENES3[best]), float(losses[best])))
             oldacc[step % (dataset // samples)] = losses[best]
-        print(f"{step}, {-losses[best]}, {-np.sum(oldacc) / min(step+1, dataset // samples)}")
+        print(f"{step}, {-losses[best]}, {idhk}")
 
         # produce next gen: elitism + crossover/mutation (very simple)
         new1, new2, new3 = [], [], []
@@ -1048,5 +1057,5 @@ def run_demo(
 
 # 実行例（まず「ちゃんと動くか」を見る用）
 if __name__ == "__main__":
-    elites = run_demo(MODELLEN=8192, POP=256, iters=10000, samples=2048, last_k=1, change_every=1)
+    elites = run_demo(MODELLEN=8192, POP=256, iters=10000, samples=1024, last_k=1, change_every=1)
     print("done. best elite corr:", max(e[-1] for e in elites))
