@@ -1,44 +1,25 @@
 import numpy as np
 from numba import njit
 from copy import deepcopy
-import time
-import gc
-import warnings
+import time, gc, warnings
 from scipy.stats import spearmanr, rankdata
-#from datasets import load_dataset
+import tqdm
 
-# Load the high-quality subset
-#data = load_dataset("HuggingFaceTB/finemath", "finemath-4plus")
-#print(data[0])
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-
+# =========================
+# Chatterjee correlation (your version)
+# =========================
 def chatterjee_correlation(x, y):
-    """
-    Chatterjeeの順位相関係数 (ξn) を計算する関数
-    """
     x = np.asarray(x)
     y = np.asarray(y)
     n = len(x)
-    
-    # 1. Xの昇順にデータをソートする
-    # argsortを使ってインデックスを取得し、Yを並べ替える
     sort_idx = np.argsort(x)
     y_sorted = y[sort_idx]
-    
-    # 2. Yの順位(ランク)を計算する
-    # rankdataはデフォルトで平均順位を返すが、ここでは単純化のためordinalを使う
-    # (厳密にはタイの処理が必要だが、概念理解のため簡略化)
     r = rankdata(y_sorted, method='ordinal')
-    
-    # 3. 隣り合うランクの差の絶対値の総和を計算
     diff_sum = np.sum(np.abs(np.diff(r)))
-    
-    # 4. 公式に当てはめる
     xi = 1 - (3 * diff_sum) / (n**2 - 1)
-    
     return xi
-
-warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 # =========================
 # 1D helper (TT/TT2)
@@ -58,16 +39,13 @@ def TT2(x):
                            np.ones(1, x.dtype)))
 
 # =========================
-# Stable-ish polynomial "attention"
-# (normal equation with powers, solve small system)
+# Stable-ish polynomial attention (your version)
 # =========================
 def _attn_poly_fast(k, v, q, deg: int):
-    # Ensure inputs are finite and not too extreme
     k = np.nan_to_num(k, nan=0.0, posinf=1e6, neginf=-1e6).astype(np.float64).ravel()
     v = np.nan_to_num(v, nan=0.0, posinf=1e6, neginf=-1e6).astype(np.float64).ravel()
     q = np.nan_to_num(q, nan=0.0, posinf=1e6, neginf=-1e6).astype(np.float64).ravel()
 
-    # Normalize k and q to range around [-1, 1] for stable polynomial basis
     scale = np.max(np.abs(k)) + 1e-12
     kn = k / scale
     qn = q / scale
@@ -75,37 +53,29 @@ def _attn_poly_fast(k, v, q, deg: int):
     size = deg + 1
     max_pow = 2 * deg
 
-    # P[n, m] = kn[n]^m for m=0..2deg
     with np.errstate(over='ignore', invalid='ignore'):
         P = kn[:, None] ** np.arange(max_pow + 1, dtype=np.float64)
-    
-    # Ensure P is finite (should be if kn in [-1, 1])
+
     if not np.all(np.isfinite(P)):
         return np.zeros_like(q, dtype=np.float64)
 
-    # A[i,j] = sum kn^(i+j)
     A = np.empty((size, size), dtype=np.float64)
     for i in range(size):
         A[i] = P[:, i:i+size].sum(axis=0)
 
-    # b[i] = sum v*kn^i
     b = (v[:, None] * P[:, :size]).sum(axis=0)
 
-    # adaptive ridge for stability
     ridge = 1e-8 * np.trace(A) / size if size > 0 else 1e-10
     A = A + np.eye(size, dtype=np.float64) * max(ridge, 1e-10)
 
-    # solve
     try:
         coef = np.linalg.solve(A, b)
     except np.linalg.LinAlgError:
         try:
             coef = np.linalg.lstsq(A, b, rcond=1e-15)[0]
         except np.linalg.LinAlgError:
-            # Last resort: return something safe if it still fails to converge
             return np.zeros_like(q, dtype=np.float64)
 
-    # Evaluate at normalized qn
     Q = qn[:, None] ** np.arange(size, dtype=np.float64)
     return (Q @ coef).astype(np.float64)
 
@@ -118,8 +88,7 @@ ggg  = lambda x: np.abs(x)**0.2    * np.sign(x)
 gggg = lambda x: np.abs(x)**(1/11) * np.sign(x)
 
 # =========================================================
-# 1/2/3-ary function sets (your version, kept mostly)
-#  - each must take/return 1D arrays of same length
+# funcs_1 / funcs_2 / funcs_3 (your version)
 # =========================================================
 funcs_1 = [
     lambda x: x + 1,
@@ -138,18 +107,12 @@ funcs_1 = [
     lambda x: TT(TT(TT(TT(x)))),
     lambda x: x * 0.5,
     lambda x: np.flip(x),
-    lambda x: np.concatenate((x[-1:], x[:-1])),
-    lambda x: np.concatenate((x[1:], x[:1])),
-    lambda x: np.concatenate((x[-2:], x[:-2])),
-    lambda x: np.concatenate((x[2:], x[:2])),
-    lambda x: np.concatenate((x[:-4], x[:-4])),
-    lambda x: np.concatenate((x[4:], x[:4])),
-    lambda x: np.concatenate((x[:-8], x[:-8])),
-    lambda x: np.concatenate((x[8:], x[:8])),
-    lambda x: np.concatenate((x[:-16], x[:-16])),
-    lambda x: np.concatenate((x[16:], x[:16])),
-    lambda x: np.concatenate((x[:-32], x[:-32])),
-    lambda x: np.concatenate((x[32:], x[:32])),
+    lambda x: np.concatenate((np.zeros(1, x.dtype), x[:-1])),
+    lambda x: np.concatenate((x[1:], np.zeros(1, x.dtype))),
+    lambda x: np.concatenate((np.zeros(2, x.dtype), x[:-2])),
+    lambda x: np.concatenate((x[2:], np.zeros(2, x.dtype))),
+    lambda x: np.concatenate((np.zeros(4, x.dtype), x[:-4])),
+    lambda x: np.concatenate((x[4:], np.zeros(4, x.dtype))),
     lambda x: np.mean(x, dtype=np.float64) + x * 0,
     lambda x: (np.log(np.std(x) + 1e-12)).astype(np.float64) + x * 0,
     lambda x: x * 0.1,
@@ -206,13 +169,11 @@ funcs_3 = [
     lambda x, y, z: np.sign(x * y * z) * np.abs(x * y * z) ** (1/3),
     lambda x, y, z: x + y - z,
     lambda x, y, z: np.sqrt(x ** 2 + y ** 2 + z ** 2),
-    lambda x, y, z: np.fft.ifft(np.fft.fft(x) * np.fft.fft(y) / (np.fft.fft(z + 1e-12))).real,
-    lambda x, y, z: np.fft.ifft(np.fft.fft(x) * np.fft.fft(np.tanh(y)) / (np.fft.fft(np.tanh(z)))).real,
-    lambda x, y, z: np.fft.ifft(np.fft.fft(x) * np.fft.fft(np.tanh(y)+1) / (np.fft.fft(np.tanh(z)+1))).real,
+    lambda x, y, z: np.fft.ifft(np.fft.fft(x) * np.fft.fft(y) / (np.fft.fft(z) + 1e-12)).real,
+    lambda x, y, z: np.fft.ifft(np.fft.fft(x) * np.fft.fft(np.tanh(y)) / (np.fft.fft(np.tanh(z)) + 1e-12)).real,
+    lambda x, y, z: np.fft.ifft(np.fft.fft(x) * np.fft.fft(np.tanh(y)+1) / (np.fft.fft(np.tanh(z)+1) + 1e-12)).real,
     lambda x, y, z: attn_poly3_fast(x**3, y**3, z),
     lambda x, y, z: gg(attn_poly3_fast(x, y**3, z)),
-    lambda x, y, z: attn_poly3_fast(x, y, z),
-    lambda x, y, z: gg(attn_poly3_fast(x**3, y**3, z**3)),
     lambda x, y, z: attn_poly5_fast(x, y, z),
     lambda x, y, z: ggg(attn_poly5_fast(x**5, y**5, z**5)),
     lambda x, y, z: attn_poly5_fast(x**5, y**5, z),
@@ -235,25 +196,13 @@ len_i0 = len(i0t)
 len_i1 = len(i1t)
 len_i2 = len(i2t)
 
-def build_T_distribution_1d(
-    i0t, i1t, i2t,
-    L=64,             # 1Dベクトル長
-    repeats=80,        # 1関数あたりの平均化回数（重いなら下げる）
-    warmup=5,          # ウォームアップ回数
-    power=0.5,         # 元コードの 0.7
-    seed=0,
-    eps=1e-12,
-):
-    """
-    各関数の平均実行時間を測って、遅いほど選ばれにくい分布Tを返す。
-    返り値:
-      T: shape (len(i0t)+len(i1t)+len(i2t),)  正規化済み確率
-      times: 同shapeで平均秒
-    """
+# =========================
+# Build T distribution (your version)
+# =========================
+def build_T_distribution_1d(i0t, i1t, i2t, L=64, repeats=80, warmup=5, power=0.7, seed=0, eps=1e-12):
     rng = np.random.default_rng(seed)
 
     def _bench_unary(f):
-        # 入力を毎回変える（キャッシュ効果/分岐癖を減らす）
         x = rng.normal(0, 1, size=L).astype(np.float32)
         for _ in range(warmup):
             y = f(x)
@@ -265,7 +214,6 @@ def build_T_distribution_1d(
             x = rng.normal(0, 1, size=L).astype(np.float32)
             y = f(x)
             y = np.asarray(y, dtype=np.float32).ravel()
-            # 形が変わる関数が混ざっても落ちないように丸める
             if y.size != L:
                 y = np.resize(y, L)
         t1 = time.perf_counter()
@@ -312,40 +260,23 @@ def build_T_distribution_1d(
         return (t1 - t0) / repeats
 
     times = []
-
-    # --- unary ---
-    for idx, f in enumerate(i0t):
-        try:
-            dt = _bench_unary(f)
-        except Exception:
-            dt = 1e9  # 壊れる関数は極端に重い扱いにして選ばれないように
+    for f in i0t:
+        try: dt = _bench_unary(f)
+        except Exception: dt = 1e9
         times.append(dt)
-
-    # --- binary ---
-    for idx, f in enumerate(i1t):
-        try:
-            dt = _bench_binary(f)
-        except Exception:
-            dt = 1e9
+    for f in i1t:
+        try: dt = _bench_binary(f)
+        except Exception: dt = 1e9
         times.append(dt)
-
-    # --- ternary ---
-    for idx, f in enumerate(i2t):
-        try:
-            dt = _bench_ternary(f)
-        except Exception:
-            dt = 1e9
+    for f in i2t:
+        try: dt = _bench_ternary(f)
+        except Exception: dt = 1e9
         times.append(dt)
 
     times = np.asarray(times, dtype=np.float64)
-
-    # 遅いほど確率小: w = 1/(t^power)
     w = 1.0 / (np.maximum(times, eps) ** power)
-
-    # 全部ゼロになった場合の保険
     if not np.isfinite(w).all() or w.sum() <= 0:
         w = np.ones_like(w)
-
     T = (w / w.sum()).astype(np.float64)
     return T, times
 
@@ -353,7 +284,7 @@ T, times = build_T_distribution_1d(i0t, i1t, i2t)
 print("function distribution T:", T)
 
 # =========================
-# Structured execution engine (1D)
+# Numba: used-nodes (your version)
 # =========================
 QUANT_BITS = 12
 QUANT_SCALE = (1 << QUANT_BITS) - 1
@@ -424,8 +355,12 @@ def _hash_insert_get_sid(keys, vals, key, next_sid, mask):
         else:
             h = (h + 1) & mask
 
+# =========================
+# ★G3なし版 precompute_structs_numba
+#    - a_quant は常に 0（alpha=0固定）
+# =========================
 @njit(cache=True)
-def precompute_structs_numba(G1, G2, G3, len_i0, len_i1, len_i2, num_inputs, last_k=10):
+def precompute_structs_numba_noG3(G1, G2, len_i0, len_i1, len_i2, num_inputs, last_k=10):
     N = G1.shape[0]
     MODELLEN = G1.shape[1]
     used = compute_used_nodes_numba(G1, G2, MODELLEN, last_k, len_i0, len_i1, num_inputs)
@@ -469,6 +404,8 @@ def precompute_structs_numba(G1, G2, G3, len_i0, len_i1, len_i2, num_inputs, las
     pairs_node = np.empty(total_used + 1, dtype=np.int32)
     pair_pos = 0
 
+    a_quant = 0  # ★固定（G3撤去）
+
     for node in range(MODELLEN):
         for ind in range(N):
             if used[ind, node] == 0:
@@ -482,10 +419,6 @@ def precompute_structs_numba(G1, G2, G3, len_i0, len_i1, len_i2, num_inputs, las
                 continue
 
             func_id = int(G2[ind, node])
-
-            a_quant = int(np.floor(G3[ind, node] * QUANT_SCALE + 0.5))
-            if a_quant < 0: a_quant = 0
-            if a_quant > QUANT_SCALE: a_quant = QUANT_SCALE
 
             if func_id < len_i0:
                 a = int(abs(G1[ind, node, 0]))
@@ -531,7 +464,7 @@ def precompute_structs_numba(G1, G2, G3, len_i0, len_i1, len_i2, num_inputs, las
                     struct_ch2[sid] = child_b
                     struct_ch3[sid] = child_c
 
-                struct_alpha[sid] = float(a_quant) / float(QUANT_SCALE)
+                struct_alpha[sid] = 0.0  # ★固定
 
             node_structs[ind, node] = sid
             pairs_ind[pair_pos] = ind
@@ -546,7 +479,6 @@ def precompute_structs_numba(G1, G2, G3, len_i0, len_i1, len_i2, num_inputs, las
     struct_ch3   = struct_ch3[:S].copy()
     struct_alpha = struct_alpha[:S].copy()
 
-    # map struct -> nodes (unused here, but kept)
     counts = np.zeros(S, dtype=np.int32)
     for p in range(pair_pos):
         sid = node_structs[pairs_ind[p], pairs_node[p]]
@@ -672,7 +604,6 @@ def topo_sort_structs_numba_from_arrays(struct_type, struct_ch1, struct_ch2, str
     return out
 
 def _as_vec32(y, L):
-    # なるべくコピーしないで float32 1D に揃える
     if isinstance(y, np.ndarray):
         if y.dtype != np.float32:
             y = y.astype(np.float32, copy=False)
@@ -699,21 +630,16 @@ def batch_exec_structured_logits_1d(
     restrict=True,
 ):
     x_inputs = np.asarray(x_inputs, dtype=np.float32)
-    if x_inputs.ndim != 2:
-        raise ValueError("x_inputs must be (num_inputs, L)")
     num_inputs, L = x_inputs.shape
-
     N = node_structs.shape[0]
     MODELLEN = node_structs.shape[1]
     S = struct_type.shape[0]
 
-    # --- needed mask (Pythonで十分軽いが、リストappendを減らす) ---
     if restrict:
         needed = np.zeros(S, dtype=np.bool_)
         start0 = max(num_inputs, MODELLEN - last_k)
         q = np.empty(N * last_k + 1024, dtype=np.int32)
         qlen = 0
-
         for ind in range(N):
             for ln in range(start0, MODELLEN):
                 sid = int(node_structs[ind, ln])
@@ -729,27 +655,24 @@ def batch_exec_structured_logits_1d(
             s = int(q[qi]); qi += 1
             c1 = int(struct_ch1[s]); c2 = int(struct_ch2[s]); c3 = int(struct_ch3[s])
             if c1 >= 0 and not needed[c1]:
-                needed[c1] = True; 
+                needed[c1] = True
                 if qlen >= q.size: q = np.resize(q, q.size * 2)
                 q[qlen] = c1; qlen += 1
             if c2 >= 0 and not needed[c2]:
-                needed[c2] = True; 
+                needed[c2] = True
                 if qlen >= q.size: q = np.resize(q, q.size * 2)
                 q[qlen] = c2; qlen += 1
             if c3 >= 0 and not needed[c3]:
-                needed[c3] = True; 
+                needed[c3] = True
                 if qlen >= q.size: q = np.resize(q, q.size * 2)
                 q[qlen] = c3; qlen += 1
     else:
-        needed = None  # 全部必要扱い
+        needed = None
 
-    # --- outputs ---
     outputs = [None] * S
-    # input sid 0..num_inputs-1
     for i in range(min(num_inputs, S)):
         outputs[i] = x_inputs[i]
 
-    # ローカル参照で少し速く
     _i0t = i0t; _i1t = i1t; _i2t = i2t
     _stype = struct_type
     _sf = struct_func
@@ -766,6 +689,7 @@ def batch_exec_structured_logits_1d(
         if t == 0:
             continue
 
+        # ★alpha=0固定なので mix は実質 base のみになる
         a = float(_alpha[sid])
 
         if t == 1:
@@ -774,7 +698,6 @@ def batch_exec_structured_logits_1d(
             x = outputs[c1]
             base = _i0t[fid](x)
             base = _as_vec32(base, L)
-            # alpha mix: (1-a)*base + a*x
             outputs[sid] = base * (1.0 - a) + x * a
 
         elif t == 2:
@@ -796,7 +719,6 @@ def batch_exec_structured_logits_1d(
         else:
             raise RuntimeError(f"unknown struct type: {t}")
 
-    # --- logits: last_k の sid だけ集計（np.uniqueをやめる）---
     last_nodes = np.arange(max(0, MODELLEN - last_k), MODELLEN, dtype=np.int32)
     last_sids = node_structs[:, last_nodes]  # (N,last_k)
 
@@ -830,32 +752,31 @@ def batch_exec_structured_logits_1d(
     return logits
 
 # =========================
-# Safe correlation loss (no NaN/-inf)
+# Safe correlation (fix: max() properly)
 # =========================
 def safe_corr(a, b):
     a = np.asarray(a, dtype=np.float64).ravel()
     b = np.asarray(b, dtype=np.float64).ravel()
-    return np.abs(spearmanr(a, b).correlation) #* chatterjee_correlation(a, b).max(0) * chatterjee_correlation(b, a).max(0)
-    """if a.size < 2:
-        return 0.0
-    sa = np.std(a); sb = np.std(b)
-    if sa < 1e-12 or sb < 1e-12:
-        return 0.0
-    c = np.corrcoef(a, b)[0, 1]
-    if not np.isfinite(c):
-        return 0.0
-    return float(np.abs(c))"""
-
-def loss_from_corr(c):
-    # 1-c in (0,2], log2 OK; clip for safety
-    return np.log2(1-c)
+    c0 = np.corrcoef(a, b)[0, 1]
+    if not np.isfinite(c0):
+        return -100000
+    c1 = spearmanr(a, b).correlation
+    if not np.isfinite(c1):
+        c1 = 0.0
+    c2 = chatterjee_correlation(a, b)
+    c3 = chatterjee_correlation(b, a)
+    c2 = max(float(c2), 0.0)
+    c3 = max(float(c3), 0.0)
+    a = abs(c0) * abs(c1) * c2 * c3
+    return np.log(a) - np.log(1 - a)
 
 # =========================
-# Example: your gendata() style
+# Your data generator (unchanged)
 # =========================
 A = {"0":0,"1":1,"2":2,"3":3,"4":4,"5":5,"6":6,"7":7,"8":8,"9":9,"+":10,"-":11,"*":12,"/":13,"=":14}
+
 def generatetekito():
-    S = int(np.random.randint(1, 2 ** np.random.randint(4, 32)))
+    S  = int(np.random.randint(1, 2 ** np.random.randint(4, 32)))
     S2 = int(np.random.randint(1, 2 ** np.random.randint(4, 32)))
     S3 = int(np.random.randint(1, 2 ** np.random.randint(4, 32)))
     enz = np.random.randint(0, 13)
@@ -876,194 +797,207 @@ def generatetekito():
 def gendata(g, tt):
     at = [A[_] for _ in g]
     s = ((len(at) - tt) / len(at))
-    g = np.random.choice(len(at), len(at), replace=False)
+    gidx = np.random.choice(len(at), len(at), replace=False)
     for i in range(tt):
         t = np.random.randint(0, 15)
-        while t == at[g[i]]:
+        while t == at[gidx[i]]:
             t = np.random.randint(0, 15)
-        at[g[i]] = t
+        at[gidx[i]] = t
     gt = np.zeros((15, len(at)), dtype=np.float32)
     for j in range(len(at)):
         gt[at[j], j] = 1.0
     return gt, np.float32(s)
 
-history = []
+# =========================================================
+# Simulated Annealing
+# =========================================================
+def mutate_neighbor(G1, G2, rng, num_inputs, MODELLEN, Tdist,
+                    ref_edits=64, op_edits=32, block_mut_p=0.02):
+    """
+    近傍生成：参照とopを少しだけランダム変更（DAG保証: ref < pos）
+    """
+    H1 = G1.copy()
+    H2 = G2.copy()
 
-import tqdm
+    stack = [len(H1)-1]
+    stack2 = [len(H1)-1]
+    while len(stack2) != 0:
+        p = stack2.pop()
+        stack.append(H1[p][0])
+        stack2.append(H1[p][0])
+        if(H2[p] >= len_i0):
+            stack.append(H1[p][0])
+            stack2.append(H1[p][1])
+        if(H2[p] >= len_i0 + len_i1):
+            stack.append(H1[p][0])
+            stack2.append(H1[p][2])
+        stack = list(filter(lambda x: x > 15, stack))
+        stack2 = list(filter(lambda x: x > 15, stack2))
+    
+    if(np.random.uniform(0, 1) < 0.5):
+        which = rng.integers(0, 3)
+        pos = stack[np.random.randint(0, len(stack))]
+        H1[pos, which] = rng.integers(0, pos)
+    else:
+        H2[stack[np.random.randint(0, len(stack))]] = rng.choice(H2.size * 0 + (len_i0 + len_i1 + len_i2), p=Tdist)
 
-# =========================
-# Minimal GA loop (tiny) to verify "runs"
-# =========================
-def run_demo(
-    MODELLEN=2048,
-    POP=32,
-    last_k=1,
-    iters=50,
-    samples=256,
+    return H1, H2
+    """# ref edits
+    for _ in range(ref_edits):
+        pos = rng.integers(num_inputs, MODELLEN)
+        which = rng.integers(0, 3)
+        H1[pos, which] = rng.integers(0, pos)
+
+    # op edits
+    for _ in range(op_edits):
+        pos = rng.integers(num_inputs, MODELLEN)
+        H2[pos] = rng.choice(H2.size * 0 + (len_i0 + len_i1 + len_i2), p=Tdist)  # scalar choice
+        # ↑ rng.choice(int, p=...) が環境でこける場合があるので下で安全に置換してもOK
+
+    # safe scalar op choice (より確実)
+    # 上が不安ならここだけ使って:
+    # for _ in range(op_edits):
+    #     pos = rng.integers(num_inputs, MODELLEN)
+    #     H2[pos] = rng.choice(np.arange(len_i0 + len_i1 + len_i2), p=Tdist)
+
+    # occasional block reset (大域的)
+    if rng.random() < block_mut_p:
+        a = rng.integers(num_inputs, MODELLEN - 2)
+        b = rng.integers(a + 1, MODELLEN)
+        H1[a:b] = rng.integers(0, a, size=(b - a, 3))
+        H2[a:b] = rng.choice(np.arange(len_i0 + len_i1 + len_i2), size=(b - a,), p=Tdist)
+
+    return H1, H2"""
+
+def eval_one(G1, G2, dats, num_inputs, last_k):
+    """
+    1個体評価：構造前計算 → batch 実行 → corr
+    """
+    # N=1 の形にする
+    G1b = G1[None, :, :]
+    G2b = G2[None, :]
+
+    node_structs, struct_type, struct_func, struct_ch1, struct_ch2, struct_ch3, struct_alpha, idxs, pairs = \
+        precompute_structs_numba_noG3(G1b, G2b, len_i0, len_i1, len_i2, num_inputs=num_inputs, last_k=last_k)
+    topo = topo_sort_structs_numba_from_arrays(struct_type, struct_ch1, struct_ch2, struct_ch3)
+
+    logits_all = []
+    targets = []
+    for gt, score in dats:
+        x_inputs = gt.astype(np.float32)
+        logit = batch_exec_structured_logits_1d(
+            x_inputs, node_structs, struct_type, struct_func, struct_ch1, struct_ch2, struct_ch3,
+            struct_alpha, topo, last_k=last_k, restrict=True
+        )[0, 0]  # (N=1,last_k=1)
+        logits_all.append(logit)
+        targets.append(score)
+
+    logits_all = np.asarray(logits_all, dtype=np.float32)
+    targets = np.asarray(targets, dtype=np.float32)
+
+    c = safe_corr(logits_all, targets)
+    return c  # maximize
+
+def run_anneal(
+    MODELLEN=8192,
+    iters=10000,
+    samples=1024,
     dataset=131072,
-    change_every=8,
-    #warmup=128,
+    last_k=1,
+    batch_every=20,          # ★数ステップごとに差し替え
+    T0=0.5,
+    Tmin=1e-6,
+    decay=0.9995,
+    seed=0,
 ):
+    rng = np.random.default_rng(seed)
+
+    # build dataset
     traindats = []
-    for __ in tqdm.tqdm(range(dataset)):
+    for _ in tqdm.tqdm(range(dataset)):
         gp = generatetekito()
         gt, score = gendata(gp, np.random.randint(1, len(gp)))
         traindats.append((gt, score))
-    # number of inputs: we feed only sid=0, but reserve a few to match your style if you want.
-    # Here: num_inputs=8 for safety. (sid 0 gets x, others zeros)
+
     num_inputs = 15
 
-    # init genes
-    idhk = 0
-    GENES1 = []
-    GENES2 = []
-    GENES3 = []
-    for _ in range(POP):
-        G1 = np.abs((1 - np.random.uniform(0, 1, (MODELLEN, 3))**1.25) * (np.arange(MODELLEN)[:, None]))
-        G2 = np.random.choice(len_i0 + len_i1 + len_i2, size=(MODELLEN,), p=T)
-        G3 = np.random.uniform(0, 1, size=(MODELLEN,)).astype(np.float32)
-        GENES1.append(G1.astype(np.int64))
-        GENES2.append(G2.astype(np.int64))
-        GENES3.append(G3.astype(np.float32))
+    # init one individual
+    G1 = np.abs((1 - rng.uniform(0, 1, (MODELLEN, 3))**1.25) * (np.arange(MODELLEN)[:, None]))
+    G1 = G1.astype(np.int64)
+    G2 = rng.choice(np.arange(len_i0 + len_i1 + len_i2), size=(MODELLEN,), p=T).astype(np.int64)
 
-    elites = []
-    dats = []
-    oldacc = np.zeros(dataset // samples)
+    # initial batch
+    batch_idx = 0
+    dats = traindats[batch_idx * samples : batch_idx * samples + samples]
+
+    cur_corr = eval_one(G1, G2, dats, num_inputs=num_inputs, last_k=last_k)
+    best_corr = cur_corr
+    best_G1 = G1.copy()
+    best_G2 = G2.copy()
+
+    temp = T0
+    history = []
 
     for step in range(iters):
-        # stack population
-        G1 = np.stack(GENES1, axis=0)  # (N,MODELLEN,3)
-        G2 = np.stack(GENES2, axis=0)  # (N,MODELLEN)
-        G3 = np.stack(np.zeros_like(GENES3), axis=0)  # (N,MODELLEN)
+        if step % batch_every == 0:
+            batch_idx = (batch_idx + 1) % (dataset // samples)
+            dats = traindats[batch_idx * samples : batch_idx * samples + samples]
 
-        node_structs, struct_type, struct_func, struct_ch1, struct_ch2, struct_ch3, struct_alpha, idxs, pairs = \
-            precompute_structs_numba(G1, G2, G3, len_i0, len_i1, len_i2, num_inputs=num_inputs, last_k=last_k)
-        topo = topo_sort_structs_numba_from_arrays(struct_type, struct_ch1, struct_ch2, struct_ch3)
+        # propose neighbor
+        H1, H2 = mutate_neighbor(
+            G1, G2, rng,
+            num_inputs=num_inputs, MODELLEN=MODELLEN, Tdist=T,
+            ref_edits=np.random.randint(1, max(8, int(np.sqrt(MODELLEN) * 0.5))),
+            op_edits=np.random.randint(1, max(4, int(np.cbrt(MODELLEN) * 0.5))),
+            block_mut_p=0.01,
+        )
 
-        losses = np.zeros(POP, dtype=np.float64)
-        corrs = np.zeros(POP, dtype=np.float64)
-        # evaluate
-        dats = traindats[(step % (dataset // samples)) * samples : (step % (dataset // samples)) * samples + samples]
-        logits_all = []
-        targets = []
-        for _ in tqdm.tqdm(dats) if step<1 else dats:
-            gt, score = _
-            x_inputs = gt.astype(np.float32)  # 1D input
-            logit = batch_exec_structured_logits_1d(
-                x_inputs, node_structs, struct_type, struct_func, struct_ch1, struct_ch2, struct_ch3,
-                struct_alpha, topo, last_k=last_k, restrict=True
-            )[:, 0]  # (POP,)
-            logits_all.append(logit)
-            targets.append(score)
+        new_corr = eval_one(H1, H2, dats, num_inputs=num_inputs, last_k=last_k)
 
-        logits_all = np.asarray(logits_all, dtype=np.float32)  # (samples, POP)
-        targets = np.asarray(targets, dtype=np.float32)        # (samples,)
+        # energy = -corr (minimize)
+        dE = (-new_corr) - (-cur_corr)  # = cur_corr - new_corr
+        accept = False
+        if dE <= 0:
+            accept = True
+        else:
+            # Metropolis
+            p = np.exp(-dE / max(temp, 1e-12))
+            if rng.random() < p:
+                accept = True
 
-        for i in range(POP):
-            c = safe_corr(logits_all[:, i], targets)
-            corrs[i] += c
-            losses[i] -= c
-        
-        rank = np.argsort(losses)  # smaller is better
-        best = rank[0]
+        if accept:
+            G1, G2 = H1, H2
+            cur_corr = new_corr
 
-        if(step == 0):
-            idhk = -losses[best]
-        idhk = 0.9 * idhk + 0.1 * -losses[best]
+        if cur_corr > best_corr:
+            best_corr = cur_corr
+            best_G1 = G1.copy()
+            best_G2 = G2.copy()
 
-        if(oldacc[step % (dataset // samples)] - losses[best] > 1e-12):
-            elites.append((deepcopy(GENES1[best]), deepcopy(GENES2[best]), deepcopy(GENES3[best]), float(losses[best])))
-            oldacc[step % (dataset // samples)] = losses[best]
-        print(f"{step}, {-losses[best]}, {idhk}")
+        history.append(best_corr)
 
-        # produce next gen: elitism + crossover/mutation (very simple)
-        new1, new2, new3 = [], [], []
-        # keep top 4
-        for k in range(min(4, POP)):
-            idx = rank[k]
-            new1.append(deepcopy(GENES1[idx]))
-            new2.append(deepcopy(GENES2[idx]))
-            new3.append(deepcopy(GENES3[idx]))
-        new1.extend([_[0] for _ in elites[-6:]])
-        new2.extend([_[1] for _ in elites[-6:]])
-        new3.extend([_[2] for _ in elites[-6:]])
-        for _ in range(6):
-            r = np.random.randint(0, len(elites))
-            new1.append(deepcopy(elites[r][0]))
-            new2.append(deepcopy(elites[r][1]))
-            new3.append(deepcopy(elites[r][2]))
+        temp = max(Tmin, temp * decay)
 
-        # rest by crossover
-        while len(new1) < POP:
-            p1 = rank[np.random.randint(0, int(np.sqrt(POP)))]
-            p2 = rank[np.random.randint(0, int(np.sqrt(POP)))]
-            c1 = deepcopy(GENES1[p1]); c2 = deepcopy(GENES2[p1]); c3 = deepcopy(GENES3[p1])
+        if step % 10 == 0:
+            print(f"step={step}  cur_corr={1 / (1 + np.exp(-cur_corr)):.6g}  best_corr={1 / (1 + np.exp(-best_corr)):.6g}  T={temp:.3g}")
 
-            a = np.random.randint(num_inputs, MODELLEN-1)
-            b = np.random.randint(a, MODELLEN)
-            c1[a:b] = GENES1[p2][a:b]
-            c2[a:b] = GENES2[p2][a:b]
-            mix = np.random.uniform(0, 1)
-            c3[a:b] = c3[a:b] * mix + GENES3[p2][a:b] * (1-mix)
+        if step % 200 == 0:
+            np.savez("anneal_best.npz", G1=best_G1, G2=best_G2, history=np.asarray(history, np.float32))
 
-            a = 1#np.random.uniform(0, 1) ** 2
-            # mutate some refs / ops / alpha
-            if np.random.rand() < 0.75 * a:
-                for _ in range(np.random.randint(2, 2**np.random.randint(2, int(np.log2(MODELLEN))))):
-                    pos = np.random.randint(num_inputs, MODELLEN)
-                    which = np.random.randint(0, 3)
-                    c1[pos, which] = np.random.randint(0, pos)  # ensure DAG
-            if np.random.rand() < 0.75 * a:
-                for _ in range(np.random.randint(2, 2**np.random.randint(2, int(np.log2(MODELLEN))))):
-                    pos = np.random.randint(num_inputs, MODELLEN)
-                    c2[pos] = np.random.choice(len_i0 + len_i1 + len_i2, p=T)
-            if np.random.rand() < 0.3 * a:
-                for _ in range(np.random.randint(1, 6)):
-                    pos = np.random.randint(num_inputs, MODELLEN)
-                    c3[pos] = np.clip(c3[pos] + np.random.normal(0, 0.2), 0.0, 1.0)
-            if np.random.rand() < 0.05 * a:
-                pos1 = np.random.randint(num_inputs, MODELLEN-2)
-                pos2 = np.random.randint(pos1, MODELLEN)
-                c2[pos1:pos2] = np.random.choice(len_i0 + len_i1 + len_i2, size=(pos2-pos1,), p=T)
-            if np.random.rand() < 0.05 * a:
-                pos1 = np.random.randint(num_inputs, MODELLEN-2)
-                pos2 = np.random.randint(pos1, MODELLEN)
-                c1[pos1:pos2] = np.random.randint(0, pos1, size=(pos2-pos1,3))
-            if np.random.rand() < 0.05 * a:
-                size = 2**np.random.randint(0, int(np.log2(MODELLEN)-2))
-                pos1 = np.random.randint(num_inputs+size, MODELLEN-size-1)
-                pos2 = np.random.randint(pos1, MODELLEN-size)
-                pos3 = np.random.randint(0, size)
-                c1[pos1+pos3:pos2+pos3] = c1[pos1:pos2]
-                c2[pos1+pos3:pos2+pos3] = c2[pos1:pos2]
-                c3[pos1+pos3:pos2+pos3] = c3[pos1:pos2]
-            if np.random.rand() < 0.05 * a:
-                size = 2**np.random.randint(0, int(np.log2(MODELLEN)-2))
-                pos1 = np.random.randint(num_inputs+size, MODELLEN-size-1)
-                pos2 = np.random.randint(pos1, MODELLEN-size)
-                pos3 = np.random.randint(0, size)
-                c1[pos1+pos3:pos2+pos3] = c1[pos1:pos2]+pos3
-                c2[pos1+pos3:pos2+pos3] = c2[pos1:pos2]
-                c3[pos1+pos3:pos2+pos3] = c3[pos1:pos2]
-            if np.random.rand() < 0.025 * a:
-                c3 = np.random.uniform(0, 1, size=(MODELLEN,)).astype(np.float32)
-            if np.random.rand() < 0.025 * a:
-                c3 = np.fft.ifft(np.fft.fft(c3) * np.fft.fft(GENES3[rank[np.random.randint(0, POP//3)]]) / np.fft.fft(GENES3[np.random.randint(0, POP)])).real
-            if np.random.rand() < 0.025 * a:
-                c3 = c3 + (GENES3[rank[np.random.randint(0, POP//3)]] - GENES3[np.random.randint(0, POP)]) * np.random.uniform(0, 1.25)
-            c3 = np.maximum(np.minimum(c3, 1), 0)
-
-            new1.append(c1); new2.append(c2); new3.append(c3)
-
-        GENES1, GENES2, GENES3 = new1, new2, new3
         gc.collect()
-        history.append(losses[best])
-        if(step%100 == 0):
-            np.savez(f"gen.npz", GENES1=GENES1, GENES2=GENES2, GENES3=GENES3, history=history)
 
-    return elites
+    return best_G1, best_G2, best_corr, history
 
-# 実行例（まず「ちゃんと動くか」を見る用）
 if __name__ == "__main__":
-    elites = run_demo(MODELLEN=4096, POP=128, iters=10000, samples=1024, last_k=1, change_every=1)
-    print("done. best elite corr:", max(e[-1] for e in elites))
+    best_G1, best_G2, best_corr, history = run_anneal(
+        iters=50001,
+        samples=1024,
+        dataset=131072,
+        last_k=1,
+        batch_every=20,
+        T0=1,
+        Tmin=1e-6,
+        decay=0.9997,
+        seed=0,
+    )
+    print("done. best_corr:", best_corr)
